@@ -1,0 +1,63 @@
+{
+  "capturedAt": "2026-11-18T15:07:40.886Z",
+  "models": [
+    {
+      "id": "gemini-4-argon",
+      "label": "Gemini 4 Argon",
+      "efforts": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "id": "gemini-4-hydrogen",
+      "label": "Gemini 4 Hydrogen",
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ]
+    },
+    {
+      "id": "gemini-pro-orchestrator-g1-pro",
+      "label": "Orchestrator (Argon)",
+      "efforts": []
+    },
+    {
+      "id": "gemini-3.8-flash",
+      "label": "Gemini 3.8 Flash",
+      "efforts": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "id": "claude-opus-5-5",
+      "label": "Claude Opus 5.5",
+      "efforts": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "id": "claude-sonnet-5-5",
+      "label": "Claude Sonnet 5.5",
+      "efforts": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "id": "gpt-oss-120b",
+      "label": "GPT-OSS 120B",
+      "efforts": [
+        "medium"
+      ]
+    }
+  ]
+}
