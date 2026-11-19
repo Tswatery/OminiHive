@@ -4,8 +4,39 @@ import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 
 const DB_PATH = path.join(homedir(), '.cc-switch', 'cc-switch.db')
-const APP_TO_AGENT = { claude: 'Claude', codex: 'Codex', agy: 'Antigravity', gemini: 'Gemini', opencode: 'OpenCode', kimi: 'Kimi', grokbuild: 'Grok', openclaw: 'OpenClaw' }
-const AGENT_TO_APP = { Claude: 'claude', Codex: 'codex', Antigravity: 'agy', Gemini: 'gemini', OpenCode: 'opencode', Kimi: 'kimi', Grok: 'grokbuild', OpenClaw: 'openclaw' }
+const ALL_AGENTS = ['Claude', 'Codex', 'Antigravity', 'Gemini', 'OpenCode', 'Kimi', 'Qwen', 'OpenClaw', 'Grok', 'Hermes', 'Pi', 'MiniMax', 'DeepSeek', 'OhMyPi', 'WorkBuddy']
+const APP_TO_AGENT = {
+  claude: 'Claude',
+  codex: 'Codex',
+  agy: 'Antigravity',
+  antigravity: 'Antigravity',
+  gemini: 'Gemini',
+  opencode: 'OpenCode',
+  kimi: 'Kimi',
+  'kimi-code': 'Kimi',
+  qwen: 'Qwen',
+  grokbuild: 'Grok',
+  grok: 'Grok',
+  openclaw: 'OpenClaw',
+  hermes: 'Hermes',
+  'hermes-agent': 'Hermes',
+  pi: 'Pi',
+  minimax: 'MiniMax',
+  'minimax-code': 'MiniMax',
+  deepseek: 'DeepSeek',
+  'deepseek-harness': 'DeepSeek',
+  dsh: 'DeepSeek',
+  omp: 'OhMyPi',
+  'oh-my-pi': 'OhMyPi',
+  ohmypi: 'OhMyPi',
+  workbuddy: 'WorkBuddy',
+  codebuddy: 'WorkBuddy'
+}
+const AGENT_TO_APPS = ALL_AGENTS.reduce((acc, ag) => {
+  acc[ag] = Object.entries(APP_TO_AGENT).filter(([, v]) => v === ag).map(([k]) => k)
+  return acc
+}, {})
+const emptyProviders = () => Object.fromEntries(ALL_AGENTS.map(a => [a, []]))
 
 function openDb() {
   if (!existsSync(DB_PATH)) return null
@@ -30,12 +61,12 @@ export function extractClaudeModelsFromEnv(env = {}) {
 export function ccSwitchSummary() {
   const db = openDb()
   if (!db) {
-    return { installed: false, providers: { Claude: [], Codex: [], Antigravity: [], Gemini: [], OpenCode: [], Kimi: [], Qwen: [], OpenClaw: [], Grok: [] }, prompts: [], mcps: [], skills: [] }
+    return { installed: false, providers: emptyProviders(), prompts: [], mcps: [], skills: [] }
   }
   try {
-    const providers = { Claude: [], Codex: [], Antigravity: [], Gemini: [], OpenCode: [], Kimi: [], Qwen: [], OpenClaw: [], Grok: [] }
+    const providers = emptyProviders()
     const rows = db.prepare(
-      "SELECT id, app_type, name, category, is_current, settings_config, sort_index FROM providers WHERE app_type IN ('claude','codex','agy','gemini','opencode','kimi','grokbuild','openclaw') ORDER BY is_current DESC, COALESCE(sort_index, 999), rowid"
+      'SELECT id, app_type, name, category, is_current, settings_config, sort_index FROM providers ORDER BY is_current DESC, COALESCE(sort_index, 999), rowid'
     ).all()
     for (const r of rows) {
       const agent = APP_TO_AGENT[r.app_type]
@@ -95,12 +126,13 @@ export function ccSwitchSummary() {
 
 export function resolveProviderConfig(agent, providerId) {
   if (!providerId) return null
-  const appType = AGENT_TO_APP[agent]
-  if (!appType) return null
+  const appTypes = AGENT_TO_APPS[agent]
+  if (!appTypes?.length) return null
   const db = openDb()
   if (!db) return null
   try {
-    const row = db.prepare('SELECT id, name, settings_config FROM providers WHERE id=? AND app_type=?').get(providerId, appType)
+    const placeholders = appTypes.map(() => '?').join(',')
+    const row = db.prepare(`SELECT id, name, settings_config FROM providers WHERE id=? AND app_type IN (${placeholders})`).get(providerId, ...appTypes)
     if (!row) return null
     const cfg = parseJson(row.settings_config, {})
     return { id: row.id, name: row.name, cfg }

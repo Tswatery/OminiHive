@@ -61,6 +61,30 @@ export async function modelList(agent,cwd){
   if(agent==='Qwen')return [{id:'',label:'跟随 Qwen 默认配置',efforts:[],isDefault:true},{id:'qwen3-coder-plus',label:'Qwen3 Coder Plus',efforts:[]}]
   if(agent==='OpenClaw')return [{id:'',label:'跟随 OpenClaw 默认配置',efforts:[],isDefault:true}]
   if(agent==='Grok')return [{id:'',label:'跟随 Grok 默认配置',efforts:[],isDefault:true},{id:'grok-4',label:'Grok 4',efforts:[]}]
+  if(agent==='Hermes')return [{id:'',label:'跟随 Hermes 默认配置',efforts:[],isDefault:true}]
+  if(agent==='Pi')return [{id:'',label:'跟随 Pi 默认配置',efforts:[],isDefault:true}]
+  if(agent==='MiniMax')return [{id:'',label:'跟随 MiniMax 默认配置',efforts:[],isDefault:true}]
+  if(agent==='DeepSeek')return [{id:'',label:'跟随 DeepSeek Harness 默认配置',efforts:[],isDefault:true}]
+  if(agent==='OhMyPi')return [{id:'',label:'跟随 Oh My Pi 默认配置',efforts:[],isDefault:true}]
+  if(agent==='WorkBuddy'){
+    const exe=binary(agent)
+    try{
+      const isMjs=exe.endsWith('.mjs')
+      const {stdout}=await promisify(execFile)(isMjs?process.execPath:exe,isMjs?[exe,'--help']:['--help'],{timeout:5000,env:{...process.env,PATH:dirs.join(':'),...(isMjs?{ELECTRON_RUN_AS_NODE:'1'}:{})}})
+      const raw=stdout.match(/Currently supported:\s*\(([^)]+)\)/i)?.[1]
+      if(raw){
+        const ids=raw.split(',').map(s=>s.trim()).filter(Boolean)
+        if(ids.length)return ids.map((id,i)=>({id:id==='auto'?'':id,label:id==='auto'?'Auto (WorkBuddy 默认)':id,efforts:[],isDefault:i===0}))
+      }
+    }catch{}
+    return [
+      {id:'',label:'Auto (WorkBuddy 默认)',efforts:[],isDefault:true},
+      {id:'glm-5.1',label:'glm-5.1',efforts:[]},
+      {id:'kimi-k2.5',label:'kimi-k2.5',efforts:[]},
+      {id:'minimax-m2.7',label:'minimax-m2.7',efforts:[]},
+      {id:'deepseek-v3-2-volc',label:'deepseek-v3-2-volc',efforts:[]}
+    ]
+  }
   const {stdout}=await promisify(execFile)(binary(agent),['models'],{cwd,timeout:16000,env:await antigravityEnv({...process.env,PATH:dirs.join(':')})})
   return gravityModels(stdout)
 }
@@ -101,8 +125,9 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
   for(const k of Object.keys(env)) if(k.startsWith('CODEX_') || k==='CLAUDECODE') {
     if (k!=='CODEX_HOME' && k!=='CODEX_SQLITE_HOME') delete env[k]
   }
-  const codex=agent==='Codex', claude=agent==='Claude', gemini=agent==='Gemini', opencode=agent==='OpenCode', kimi=agent==='Kimi', qwen=agent==='Qwen', openclaw=agent==='OpenClaw', grok=agent==='Grok'
-  const simpleCli = gemini || opencode || kimi || qwen || openclaw || grok
+  const codex=agent==='Codex', claude=agent==='Claude', workbuddy=agent==='WorkBuddy', gemini=agent==='Gemini', opencode=agent==='OpenCode', kimi=agent==='Kimi', qwen=agent==='Qwen', openclaw=agent==='OpenClaw', grok=agent==='Grok', hermes=agent==='Hermes', pi=agent==='Pi', minimax=agent==='MiniMax', deepseek=agent==='DeepSeek', ohMyPi=agent==='OhMyPi'
+  const extraSimpleCli = hermes || pi || minimax || deepseek || ohMyPi
+  const simpleCli = gemini || opencode || kimi || qwen || openclaw || grok || extraSimpleCli
   if(codex && provider){
     const sharedHome=env.CODEX_HOME||path.join(homedir(),'.codex')
     env.CODEX_SQLITE_HOME ||= sharedHome
@@ -146,6 +171,22 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
     if(model)args.push('--model',model)
     args.push('-p',imgPrompt)
   }
+  if(hermes){
+    args=['chat','-q',imgPrompt]
+    if(model)args.push('--model',model)
+  }
+  if(pi || ohMyPi){
+    args=['-p',imgPrompt]
+    if(model)args.push('--model',model)
+  }
+  if(minimax){
+    args=['-p',imgPrompt]
+    if(model)args.push('--model',model)
+  }
+  if(deepseek){
+    args=['run',imgPrompt]
+    if(model)args.push('--model',model)
+  }
   if(claude) {
     args=['-p','--verbose','--output-format','stream-json','--include-partial-messages','--restricted','--strict-mcp-config','--permission-mode',write?'acceptEdits':'dontAsk','--tools',write?'Read,Glob,Grep,Edit,Write':'Read,Glob,Grep']
     if(images.length){
@@ -156,7 +197,20 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
     if(effort)args.push('--effort',effort)
     if(session) args.push('--resume',session)
   }
-  const child=spawn(exe,args,{cwd,env:agent==='Antigravity'?await antigravityEnv(env):env,stdio:'pipe',detached:true})
+  if(workbuddy) {
+    args=['-p','--verbose','--output-format','stream-json','--include-partial-messages','--permission-mode',write?'acceptEdits':'dontAsk','--tools',write?'Read,Glob,Grep,Edit,Write':'Read,Glob,Grep']
+    if(images.length){
+      const dirsSet=new Set(images.map(i=>path.dirname(i.path)))
+      for(const d of dirsSet)args.push('--add-dir',d)
+    }
+    if(model)args.push('--model',model)
+    if(session)args.push('--resume',session)
+  }
+  const isMjsExe = exe.endsWith('.mjs')
+  const spawnCmd = isMjsExe ? process.execPath : exe
+  const spawnArgs = isMjsExe ? [exe, ...args] : args
+  if (isMjsExe) env.ELECTRON_RUN_AS_NODE = '1'
+  const child=spawn(spawnCmd,spawnArgs,{cwd,env:agent==='Antigravity'?await antigravityEnv(env):env,stdio:'pipe',detached:true})
   const lines=createInterface({input:child.stdout})
   const pending=new Map()
   let seq=0, failure, stderr='', finish, output='', currentItem='', deltas='', active=false, thoughtBuf='', lastThoughtEmit=0, closed=false, codexThreadId=''
@@ -206,13 +260,13 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
       if(e.type==='result'&&!output&&typeof e.result==='string')append(e.result)
       return
     }
-    if(openclaw || grok){
+    if(openclaw || grok || extraSimpleCli){
       append(line+'\n')
       return
     }
     let e; try{e=JSON.parse(line)}catch{return}
     const p=e.params??{}
-    if(claude){
+    if(claude || workbuddy){
       if(e.type==='system'&&e.subtype==='init'){emit('session',e.session_id);if(e.model)emitStep({id:'meta-model',kind:'info',title:'模型 · '+e.model,status:'done'})}
       const block=e.event
       if(block?.type==='content_block_start'&&block.content_block?.type==='thinking'){emitStep({id:'claude-think',kind:'thought',title:'思考中',status:'running'})}
@@ -229,7 +283,7 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
         }
       }
       if(e.type==='result'){
-        if(e.is_error)fail(Error(e.result||e.errors?.join('\n')||'Claude 执行失败'))
+        if(e.is_error)fail(Error(e.result||e.errors?.join('\n')||(workbuddy?'WorkBuddy 执行失败':'Claude 执行失败')))
         else {if(!output)append(e.result);finish()}
       }
       return
@@ -298,8 +352,8 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
       if(explicitSession)emit('session',explicitSession)
       return
     }
-    if(claude){
-      if(effort)emit('log','请求思考强度 · '+effort)
+    if(claude || workbuddy){
+      if(effort && claude)emit('log','请求思考强度 · '+effort)
       const fullPrompt=images.length?prompt+'\n\n[用户附带了以下图片文件，请使用 Read 工具查看：\n'+images.map(i=>i.path).join('\n')+'\n]':prompt
       child.stdin.end(fullPrompt);await done
       return

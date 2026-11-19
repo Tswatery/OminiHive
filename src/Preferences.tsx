@@ -1,9 +1,11 @@
 import { useState, useEffect, useRef } from 'react'
-import { Button, Dialog, Flex, IconButton, Popover, Switch, Text } from '@radix-ui/themes'
-import { Check, ChevronDown, Download, RefreshCw, RotateCcw, Settings2, Terminal, Waypoints, X, Zap } from 'lucide-react'
+import { Button, Dialog, Flex, IconButton, Popover, Select, Switch, Text } from '@radix-ui/themes'
+import { Check, ChevronDown, Download, RefreshCw, RotateCcw, Settings2, Waypoints, X, Zap } from 'lucide-react'
 import type { Option } from './Controls'
 import { VolcQuota } from './VolcQuota'
 import { ModelIcon } from './ModelIcon'
+import { AgentIcon } from './AgentIcon'
+import { agentLabel } from './agentMeta'
 
 export type ModelOption = Option & { efforts: string[]; defaultEffort?: string; isDefault?: boolean }
 export type ClientInfo = {
@@ -16,12 +18,6 @@ export type ClientInfo = {
   checked?: string
   installing?: boolean
   outcome?: { error?: boolean; message: string }
-}
-
-const iconFiles: Record<string, string> = {
-  Codex: 'codex',
-  Claude: 'claudecode',
-  Antigravity: 'antigravity'
 }
 
 function EffortCapsuleSlider({
@@ -260,15 +256,7 @@ export type CCSwitchSummary = {
 }
 
 function AgentGlyph({ name, size = 20 }: { name: string; size?: number }) {
-  if (iconFiles[name]) {
-    return <img className="agent-icon" src={'./agents/' + iconFiles[name] + '.svg'} width={size} height={size} alt="" />
-  }
-  if (name === 'Gemini') return <ModelIcon model="gemini" size={size} />
-  if (name === 'Qwen') return <ModelIcon model="qwen" size={size} />
-  if (name === 'Kimi') return <span className="agent-badge kimi" style={{ width: size, height: size, fontSize: Math.round(size * 0.58) }}>K</span>
-  if (name === 'Grok') return <span className="agent-badge grok" style={{ width: size, height: size, fontSize: Math.round(size * 0.58) }}>G</span>
-  if (name === 'OpenClaw') return <span className="agent-badge claw" style={{ width: size, height: size, fontSize: Math.round(size * 0.58) }}>C</span>
-  return <Terminal size={size - 2} />
+  return <AgentIcon name={name} size={size} />
 }
 
 export function Settings({
@@ -336,69 +324,78 @@ export function Settings({
         {tab === 'apps' ? (
           <>
             <div className="app-list">
-              {rows.map(row => {
-                const isInstalled = row.candidates.length > 0
-                const hasUpdate = row.status === '有新版'
-                const showInstallBtn = (!isInstalled && row.canInstall) || hasUpdate || row.installing
-                const isEnabled = enabledAgents[row.agent] ?? isInstalled
-                return (
-                  <section key={row.agent} className="app-row">
-                    <div className="app-row-main">
-                      <div className="app-icon-box">
-                        <AgentGlyph name={row.agent} size={22} />
-                      </div>
-                      <div className="app-meta">
-                        <strong>{row.agent}</strong>
-                        <span>{row.hint || row.candidates[0]?.path || ''}</span>
-                      </div>
-                      <div className="app-ver">
-                        {isInstalled ? (
-                          <>
-                            <code>{row.candidates[0].version}</code>
-                            {hasUpdate && <small className="has-update">有新版 {row.latest}</small>}
-                          </>
-                        ) : (
-                          <span className="not-installed">未安装</span>
+              {[
+                { label: '已安装', items: rows.filter(r => r.candidates.length > 0) },
+                { label: '未安装', items: rows.filter(r => r.candidates.length === 0) }
+              ].filter(g => g.items.length > 0).map(group => (
+                <div key={group.label} className="app-group">
+                  <div className="app-group-label">{group.label} · {group.items.length}</div>
+                  {group.items.map(row => {
+                    const isInstalled = row.candidates.length > 0
+                    const hasUpdate = row.status === '有新版'
+                    const showInstallBtn = (!isInstalled && row.canInstall) || hasUpdate || row.installing
+                    const isEnabled = enabledAgents[row.agent] ?? isInstalled
+                    const verText = row.candidates[0]?.version === '0.0.0' ? '已安装' : row.candidates[0]?.version
+                    return (
+                      <section key={row.agent} className="app-row">
+                        <div className="app-row-main">
+                          <div className="app-icon-box">
+                            <AgentGlyph name={row.agent} size={22} />
+                          </div>
+                          <div className="app-meta">
+                            <strong>{agentLabel(row.agent)}</strong>
+                            <span>{row.hint || row.candidates[0]?.path || ''}</span>
+                          </div>
+                          <div className="app-ver">
+                            {isInstalled ? (
+                              <>
+                                <code>{verText}</code>
+                                {hasUpdate && <small className="has-update">有新版 {row.latest}</small>}
+                              </>
+                            ) : (
+                              <span className="not-installed">未安装</span>
+                            )}
+                          </div>
+                          <div className="app-actions">
+                            {showInstallBtn && (
+                              <Button
+                                size="1"
+                                variant="soft"
+                                disabled={row.installing}
+                                loading={row.installing}
+                                onClick={() => void install(row)}
+                              >
+                                <Download size={12} />
+                                {isInstalled ? '升级' : '安装'}
+                              </Button>
+                            )}
+                            <Switch
+                              size="1"
+                              checked={isEnabled}
+                              disabled={!isInstalled}
+                              title={isInstalled ? '控制该 Agent 是否允许被拉入讨论群聊' : '请先安装后再启用'}
+                              onCheckedChange={checked => onToggleAgent(row.agent, checked)}
+                            />
+                          </div>
+                        </div>
+                        {row.candidates[0] && <p className="version-path">{row.candidates[0].path}</p>}
+                        {row.outcome && (
+                          <Text as="p" size="1" mt="1" color={row.outcome.error ? 'red' : 'green'} role={row.outcome.error ? 'alert' : 'status'}>
+                            {row.outcome.message}
+                          </Text>
                         )}
-                      </div>
-                      <div className="app-actions">
-                        {showInstallBtn && (
-                          <Button
-                            size="1"
-                            variant="soft"
-                            disabled={row.installing}
-                            loading={row.installing}
-                            onClick={() => void install(row)}
-                          >
-                            <Download size={12} />
-                            {isInstalled ? '升级' : '安装'}
-                          </Button>
-                        )}
-                        <Switch
-                          size="1"
-                          checked={isEnabled}
-                          disabled={!isInstalled}
-                          title={isInstalled ? '控制在聊天栏中是否显示该 Agent' : '请先安装后再启用'}
-                          onCheckedChange={checked => onToggleAgent(row.agent, checked)}
-                        />
-                      </div>
-                    </div>
-                    {row.candidates[0] && <p className="version-path">{row.candidates[0].path}</p>}
-                    {row.outcome && (
-                      <Text as="p" size="1" mt="1" color={row.outcome.error ? 'red' : 'green'} role={row.outcome.error ? 'alert' : 'status'}>
-                        {row.outcome.message}
-                      </Text>
-                    )}
-                  </section>
-                )
-              })}
+                      </section>
+                    )
+                  })}
+                </div>
+              ))}
             </div>
             {error && <p className="error-inline" role="alert">{error}</p>}
             <Flex justify="between" align="center" gap="2" mt="3">
               <Text size="1" color="gray">
                 {rows.find(r => r.checked)?.checked
                   ? '上次检查 ' + new Date(rows.find(r => r.checked)!.checked!).toLocaleTimeString()
-                  : '安装或启用后即可在聊天界面直接 @ 使用'}
+                  : '启用后可在讨论顶部点击「群成员」拉入协作'}
               </Text>
               <Button size="2" variant="soft" loading={busy} onClick={() => void refresh(true)}>
                 <RefreshCw size={13} /> 检查更新
@@ -420,22 +417,30 @@ export function Settings({
                     const pickedId = providers[ag] || ''
                     const current = list.find(p => p.isCurrent)
                     const active = list.find(p => p.id === pickedId) || current
+                    const selectVal = pickedId || '__follow__'
                     return (
                       <section key={ag} className="version-card">
                         <div className="route-card-head">
                           <AgentGlyph name={ag} size={18} />
-                          <strong>{ag}</strong>
-                          <select
-                            className="route-select"
-                            value={pickedId}
-                            onChange={e => onProviderChange(ag, e.target.value)}
-                            aria-label={ag + ' 供应商路由'}
+                          <strong>{agentLabel(ag)}</strong>
+                          <Select.Root
+                            size="1"
+                            value={selectVal}
+                            onValueChange={v => onProviderChange(ag, v === '__follow__' ? '' : v)}
                           >
-                            <option value="">跟随 CC Switch 当前{current ? ` (${current.name})` : ''}</option>
-                            {list.map(p => (
-                              <option key={p.id} value={p.id}>{p.name}{p.isCurrent ? ' (当前)' : ''}</option>
-                            ))}
-                          </select>
+                            <Select.Trigger className="route-select-trigger" aria-label={agentLabel(ag) + ' 供应商路由'} />
+                            <Select.Content position="popper" sideOffset={4} className="route-select-content">
+                              <Select.Item value="__follow__">
+                                跟随 CC Switch 当前{current ? ` (${current.name})` : ''}
+                              </Select.Item>
+                              <Select.Separator />
+                              {list.map(p => (
+                                <Select.Item key={p.id} value={p.id}>
+                                  {p.name}{p.isCurrent ? ' (当前)' : ''}
+                                </Select.Item>
+                              ))}
+                            </Select.Content>
+                          </Select.Root>
                         </div>
                         {active && active.models.length > 0 && (
                           <div className="cc-eco-tags">

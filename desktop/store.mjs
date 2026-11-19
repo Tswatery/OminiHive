@@ -4,7 +4,10 @@ import { realpathSync, statSync } from 'node:fs'
 import path from 'node:path'
 import { homedir } from 'node:os'
 
-const KNOWN_AGENTS = ['Codex', 'Claude', 'Antigravity', 'Gemini', 'OpenCode', 'Kimi', 'Qwen', 'OpenClaw', 'Grok']
+const KNOWN_AGENTS = ['Codex', 'Claude', 'Antigravity', 'Gemini', 'OpenCode', 'Kimi', 'Qwen', 'OpenClaw', 'Grok', 'Hermes', 'Pi', 'MiniMax', 'DeepSeek', 'OhMyPi', 'WorkBuddy']
+const AGENT_PATTERN = KNOWN_AGENTS.join('|')
+const LEADING_MENTION_RE = new RegExp(`^@(${AGENT_PATTERN}|all)(?:\\s+([\\s\\S]*))?$`, 'i')
+const ANY_MENTION_RE = new RegExp(`(?:^|\\s)@(${AGENT_PATTERN}|all)(?=\\s|$|[，。,.!?！？])`, 'gi')
 const MAX_CONTEXT_CHARS = 24000
 
 function clipHeadTail(text, limit) {
@@ -49,14 +52,14 @@ export function routeTargets(text, fallbackAgents) {
   }
 
   while (true) {
-    const m = rest.match(/^@(Codex|Claude|Antigravity|Gemini|OpenCode|Kimi|Qwen|OpenClaw|Grok|all)(?:\s+([\s\S]*))?$/i)
+    const m = rest.match(LEADING_MENTION_RE)
     if (!m) break
     addAgent(m[1])
     rest = (m[2] || '').trimStart()
   }
 
   if (!agents.length) {
-    for (const m of rest.matchAll(/(?:^|\s)@(Codex|Claude|Antigravity|Gemini|OpenCode|Kimi|Qwen|OpenClaw|Grok|all)(?=\s|$|[，。,.!?！？])/gi)) {
+    for (const m of rest.matchAll(ANY_MENTION_RE)) {
       addAgent(m[1])
     }
   }
@@ -199,7 +202,7 @@ export class Store {
     const task = parsed.task
     const project = this.get('SELECT p.dir FROM projects p JOIN rooms r ON p.id=r.project WHERE r.id=?', room)
     if (!project || canonical(project.dir) !== project.dir) throw Error('项目目录已变化，请重新选择')
-    const hasMention = /(?:^|\s)@(?:Codex|Claude|Antigravity|all)(?=\s|$|[，。,.!?！？])/i.test(text)
+    const hasMention = new RegExp(`(?:^|\\s)@(?:${AGENT_PATTERN}|all)(?=\\s|$|[，。,.!?！？])`, 'i').test(text)
     const prefix = parsed.isAll ? '@all' : '@' + agents.join(' @')
     const displayText = hasMention ? text.trim() : prefix + ' ' + task
     const attJson = savedImages.length ? JSON.stringify(savedImages.map(i => ({ path: i.path, name: i.name, dataUrl: i.preview }))) : ''

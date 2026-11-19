@@ -3,20 +3,21 @@ import { createRoot } from 'react-dom/client'
 import {
   Folder, FolderPlus, FolderOpen, MessageSquare, Plus, ArrowUp, Square,
   Shield, ShieldAlert, Hexagon, Terminal, PanelLeft, Compass, Copy, Check,
-  RotateCcw, Sparkles, ChevronRight, X, Forward, Users, ImagePlus, FolderTree
+  RotateCcw, Sparkles, ChevronRight, X, Forward, Users, ImagePlus, FolderTree, UserPlus
 } from 'lucide-react'
 import { Theme, Button } from '@radix-ui/themes'
 import '@radix-ui/themes/styles.css'
 import { DeleteButton } from './Controls'
 import { ModelEffortPicker, Settings, type ModelOption, type ClientInfo, type CCSwitchSummary } from './Preferences'
-import { ModelIcon } from './ModelIcon'
+import { AgentIcon } from './AgentIcon'
+import { RoomMembersPicker, TargetSelector } from './RoomMembers'
+import { ALL_AGENTS, CORE_AGENTS, AGENT_CLASS, agentLabel, agentShort, agentMatchesQuery, type Agent } from './agentMeta'
 import { MarkdownView } from './MarkdownView'
 import type { QuotaResult } from './VolcQuota'
 import { FileDrawer, type FileEntry, type PreviewResult } from './FileDrawer'
 import './tokens.css'
 import './style.css'
 
-type Agent = 'Codex' | 'Claude' | 'Antigravity' | 'Gemini' | 'OpenCode' | 'Kimi' | 'Qwen' | 'OpenClaw' | 'Grok'
 type Project = { id: string; name: string; dir: string }
 type Room = { id: string; project: string; title: string }
 type Msg = { id: string; author: string; body: string; log: string; status: string; time: number; duration?: number; attachments?: string }
@@ -57,13 +58,13 @@ declare global {
 }
 
 const api = window.hive
-const allAgents: Agent[] = ['Codex', 'Claude', 'Antigravity', 'Gemini', 'OpenCode', 'Kimi', 'Qwen', 'OpenClaw', 'Grok']
-const coreAgents: Agent[] = ['Codex', 'Claude', 'Antigravity']
-const iconFiles: Partial<Record<Agent, string>> = { Codex: 'codex', Claude: 'claudecode', Antigravity: 'antigravity' }
-const agentClass: Record<Agent, string> = {
-  Codex: 'codex', Claude: 'claude', Antigravity: 'antigravity',
-  Gemini: 'antigravity', OpenCode: 'codex', Kimi: 'antigravity', Qwen: 'codex', OpenClaw: 'claude', Grok: 'codex'
-}
+const allAgents: Agent[] = ALL_AGENTS
+const coreAgents: Agent[] = CORE_AGENTS
+const agentClass: Record<Agent, string> = AGENT_CLASS
+const AGENT_REGEX_PART = ALL_AGENTS.join('|')
+const MENTION_MATCH_RE = new RegExp(`(?:^|\\s)@(${AGENT_REGEX_PART}|all)(?=\\s|$|[，。,.!?！？])`, 'gi')
+const MENTION_SPLIT_RE = new RegExp(`(@(?:${AGENT_REGEX_PART}|all)\\b)`, 'gi')
+const LEADING_MENTIONS_RE = new RegExp(`^(?:@(?:${AGENT_REGEX_PART}|all)\\s+)+`, 'i')
 
 const STARTER_PROMPTS = [
   { title: '梳理项目结构', desc: '快速理解目录职责与核心模块', text: '帮我梳理这个项目的目录结构、核心入口和主要模块职责。' },
@@ -85,13 +86,13 @@ function loadJson<T>(key: string, fallback: T): T {
   } catch { return fallback }
 }
 
-function parseMentionedAgents(text: string): { agents: Agent[]; isAll: boolean } {
+function parseMentionedAgents(text: string, allPool: Agent[] = allAgents): { agents: Agent[]; isAll: boolean } {
   const found: Agent[] = []
   let isAll = false
-  for (const m of text.matchAll(/(?:^|\s)@(Codex|Claude|Antigravity|Gemini|OpenCode|Kimi|Qwen|OpenClaw|Grok|all)(?=\s|$|[，。,.!?！？])/gi)) {
+  for (const m of text.matchAll(MENTION_MATCH_RE)) {
     if (m[1].toLowerCase() === 'all') {
       isAll = true
-      for (const a of allAgents) if (!found.includes(a)) found.push(a)
+      for (const a of allPool) if (!found.includes(a)) found.push(a)
     } else {
       const norm = allAgents.find(a => a.toLowerCase() === m[1].toLowerCase())
       if (norm && !found.includes(norm)) found.push(norm)
@@ -101,19 +102,11 @@ function parseMentionedAgents(text: string): { agents: Agent[]; isAll: boolean }
 }
 
 function Icon({ name, size = 18 }: { name: string; size?: number }) {
-  const file = iconFiles[name as Agent]
-  if (file) return <img className="agent-icon" src={'./agents/' + file + '.svg'} width={size} height={size} alt="" />
-  if (name === 'Gemini') return <ModelIcon model="gemini" size={size} />
-  if (name === 'Qwen') return <ModelIcon model="qwen" size={size} />
-  if (name === 'Kimi') return <span className="agent-badge kimi" style={{ width: size, height: size, fontSize: Math.round(size * 0.6) }}>K</span>
-  if (name === 'Grok') return <span className="agent-badge grok" style={{ width: size, height: size, fontSize: Math.round(size * 0.6) }}>G</span>
-  if (name === 'OpenClaw') return <span className="agent-badge claw" style={{ width: size, height: size, fontSize: Math.round(size * 0.6) }}>C</span>
-  if (name === 'OpenCode') return <Terminal size={size - 2} />
-  return null
+  return <AgentIcon name={name} size={size} />
 }
 
 function UserBubble({ body, attachments }: { body: string; attachments?: string }) {
-  const parts = body.split(/(@(?:Codex|Claude|Antigravity|Gemini|OpenCode|Kimi|Qwen|OpenClaw|Grok|all)\b)/gi)
+  const parts = body.split(MENTION_SPLIT_RE)
   let imgs: { path: string; name: string; dataUrl: string }[] = []
   try { if (attachments) imgs = JSON.parse(attachments) } catch {}
   return (
@@ -425,10 +418,54 @@ function App() {
   const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>({})
   const [showFiles, setShowFiles] = useState<boolean>(() => localStorage.getItem('ominihive:files') === '1')
   const [enabledAgents, setEnabledAgents] = useState<Record<string, boolean>>(() => loadJson('ominihive:enabled', { Codex: true, Claude: true, Antigravity: true }))
-  const agents = (() => {
-    const list = allAgents.filter(a => coreAgents.includes(a) ? enabledAgents[a] !== false : Boolean(enabledAgents[a] && tree?.agents[a]))
+  const [roomMembersMap, setRoomMembersMap] = useState<Record<string, Agent[]>>(() => loadJson('ominihive:room-members', {}))
+  const [membersOpen, setMembersOpen] = useState(false)
+
+  // 统一已启用 Agent 判定（与设置页 Switch 默认值完全一致）
+  const enabledPool = (() => {
+    const list = allAgents.filter(a => {
+      const installed = Boolean(tree?.agents[a])
+      const enabled = enabledAgents[a] ?? installed
+      return tree ? (installed && enabled) : enabled
+    })
     return list.length ? list : coreAgents
   })()
+
+  const defaultRoomMembers = (() => {
+    const core = coreAgents.filter(a => enabledPool.includes(a))
+    if (core.length) return core
+    return enabledPool.slice(0, 3)
+  })()
+
+  const agents = (() => {
+    const saved = room ? roomMembersMap[room] : undefined
+    if (saved?.length) {
+      const valid = saved.filter(a => allAgents.includes(a) && (!tree || tree.agents[a]))
+      if (valid.length) return valid
+    }
+    const fromHistory = Array.from(new Set(
+      messages
+        .map(m => m.author as Agent)
+        .filter(a => allAgents.includes(a) && (!tree || tree.agents[a]))
+    ))
+    const merged = [...defaultRoomMembers]
+    for (const a of fromHistory) if (!merged.includes(a)) merged.push(a)
+    return merged.length ? merged : coreAgents
+  })()
+
+  function updateRoomMembers(next: Agent[]) {
+    if (!room || !next.length) return
+    setRoomMembersMap(prev => {
+      const updated = { ...prev, [room]: next }
+      localStorage.setItem('ominihive:room-members', JSON.stringify(updated))
+      return updated
+    })
+    setTargets(prev => {
+      const kept = prev.filter(a => next.includes(a))
+      return kept.length ? kept : [next[0]]
+    })
+  }
+
   const [providers, setProviders] = useState<Partial<Record<Agent, string>>>(() => loadJson('ominihive:providers', {}))
   const [editingRoom, setEditingRoom] = useState('')
   const [editTitle, setEditTitle] = useState('')
@@ -448,12 +485,15 @@ function App() {
   const follow = useRef(true)
   const requests = useRef<Partial<Record<Agent, number>>>({})
 
-  const parsedMentions = parseMentionedAgents(input)
   const readyAgents = tree ? agents.filter(a => tree.agents[a]) : agents
-  const activeTargets = parsedMentions.agents.length ? parsedMentions.agents : targets
+  const parsedMentions = parseMentionedAgents(input, readyAgents.length ? readyAgents : agents)
+  const scopedTargets = targets.filter(a => agents.includes(a))
+  const activeTargets = parsedMentions.agents.length
+    ? parsedMentions.agents
+    : (scopedTargets.length ? scopedTargets : [agents[0] || 'Codex'])
   const isAllMode = parsedMentions.isAll || (activeTargets.length >= readyAgents.length && readyAgents.length > 1)
-  const target = targets[0] || 'Codex'
-  const agent = activeTargets.includes(inspected) ? inspected : (activeTargets[0] || target)
+  const target = activeTargets[0] || agents[0] || 'Codex'
+  const agent = activeTargets.includes(inspected) ? inspected : target
   const agentWrite = Boolean(writes[agent])
   const anyWrite = activeTargets.some(a => Boolean(writes[a]))
   const runningInRoom = (tree?.running || []).filter(j => j.room === room)
@@ -464,10 +504,21 @@ function App() {
   const anyBusy = busyAgents.size > 0
   const targetBusy = activeTargets.some(a => busyAgents.has(a))
 
-  const mentionOptions: Array<{ id: 'all' | Agent; label: string; desc: string }> = [
-    { id: 'all' as const, label: '@all', desc: `全部就绪 (${readyAgents.length})` },
-    ...agents.map(a => ({ id: a as 'all' | Agent, label: '@' + a, desc: tree?.agents[a] ? '已就绪' : '未安装' }))
-  ].filter(o => !mention?.query || o.id.toLowerCase().startsWith(mention.query.toLowerCase()))
+  const mentionOptions: Array<{ id: 'all' | Agent; label: string; desc: string; invite?: boolean }> = (() => {
+    const q = mention?.query || ''
+    const inRoomList: Array<{ id: 'all' | Agent; label: string; desc: string; invite?: boolean }> = [
+      ...(readyAgents.length > 1 ? [{ id: 'all' as const, label: '@all', desc: `全体群员 (${readyAgents.length})` }] : []),
+      ...agents.map(a => ({ id: a as 'all' | Agent, label: '@' + a, desc: agentLabel(a) + (tree?.agents[a] ? ' · 群成员' : ' · 未安装') }))
+    ].filter(o => !q || (o.id === 'all' ? 'all'.startsWith(q.toLowerCase()) : agentMatchesQuery(o.id, q)))
+
+    const extraInvite = q
+      ? enabledPool
+          .filter(a => !agents.includes(a) && agentMatchesQuery(a, q))
+          .map(a => ({ id: a as 'all' | Agent, label: '@' + a, desc: agentLabel(a) + ' · 拉入群聊并 @', invite: true }))
+      : []
+
+    return [...inRoomList, ...extraInvite]
+  })()
 
   function setInput(val: string) {
     if (!room) return
@@ -672,8 +723,9 @@ function App() {
   function detectTriggers(val: string, cursor: number | null) {
     const pos = cursor ?? val.length
     const before = val.slice(0, pos)
-    const m = before.match(/(?:^|\s)@([a-z]*)$/i)
-    if (m && !['all', 'codex', 'claude', 'antigravity'].includes(m[1].toLowerCase())) {
+    const m = before.match(/(?:^|\s)@([a-z0-9_-]*)$/i)
+    const exactKnown = m && (m[1].toLowerCase() === 'all' || allAgents.some(a => a.toLowerCase() === m[1].toLowerCase()))
+    if (m && !exactKnown) {
       setMention({ start: pos - m[1].length - 1, end: pos, query: m[1] })
       setMentionIdx(0)
       setSlash(null)
@@ -702,8 +754,11 @@ function App() {
   }
 
   function insertMention(choice: 'all' | Agent) {
-    if (choice !== 'all' && !parsedMentions.agents.length) {
-      setTargets(prev => prev.includes(choice) ? prev : [...prev, choice])
+    if (choice !== 'all') {
+      if (!agents.includes(choice)) updateRoomMembers([...agents, choice])
+      if (!parsedMentions.agents.length) {
+        setTargets(prev => prev.includes(choice) ? prev : [...prev, choice])
+      }
     }
     const tag = '@' + choice + ' '
     if (mention) {
@@ -781,7 +836,7 @@ function App() {
   async function send(overrideText?: string, overrideTarget?: Agent | Agent[] | 'all') {
     const raw = (overrideText ?? input) || (images.length ? '请查看附带的图片' : '')
     if (!raw.trim() || !room) return
-    const sendTargets = overrideTarget ?? (parsedMentions.isAll ? 'all' : activeTargets)
+    const sendTargets = overrideTarget ?? (parsedMentions.isAll ? (readyAgents.length ? readyAgents : agents) : activeTargets)
     if (!overrideText && !Array.isArray(sendTargets) && sendTargets !== 'all' && busyAgents.has(sendTargets) && !parsedMentions.agents.length) return
     const sendImages = overrideText ? [] : images.map(i => ({ name: i.name, dataUrl: i.dataUrl }))
     setError('')
@@ -801,7 +856,7 @@ function App() {
     const slice = idx > 0 ? messages.slice(0, idx) : messages
     const lastUser = [...slice].reverse().find(m => m.author === '我')
     if (!lastUser) return
-    const task = lastUser.body.replace(/^(?:@(?:Codex|Claude|Antigravity|all)\s+)+/i, '').trim()
+    const task = lastUser.body.replace(LEADING_MENTIONS_RE, '').trim()
     if (task) void send('@' + a + ' ' + task, a)
   }
 
@@ -976,6 +1031,15 @@ function App() {
             )}
             {project && (
               <>
+                <RoomMembersPicker
+                  open={membersOpen}
+                  onOpenChange={setMembersOpen}
+                  members={agents}
+                  availableMap={tree?.agents || {}}
+                  enabledAgents={enabledAgents}
+                  onChangeMembers={updateRoomMembers}
+                  onEnableAgent={a => setEnabledAgents(prev => ({ ...prev, [a]: true }))}
+                />
                 <button
                   type="button"
                   className={'head-new-btn' + (showFiles ? ' active' : '')}
@@ -1028,12 +1092,23 @@ function App() {
                         >
                           <Icon name={a} size={20} />
                           <div>
-                            <strong>{a}</strong>
-                            <span>{available ? '已就绪' : '未检测到 CLI'}</span>
+                            <strong>{agentShort(a)}</strong>
+                            <span>{available ? '已在群 · 已就绪' : '未检测到 CLI'}</span>
                           </div>
                         </button>
                       )
                     })}
+                    <button
+                      type="button"
+                      className="quick-agent-card invite-card"
+                      onClick={() => setMembersOpen(true)}
+                    >
+                      <UserPlus size={18} />
+                      <div>
+                        <strong>拉人进群</strong>
+                        <span>支持一次多选</span>
+                      </div>
+                    </button>
                   </div>
 
                   <div className="starter-grid">
@@ -1206,36 +1281,18 @@ function App() {
               />
 
               <div className="toolbar">
-                <div className="agent-seg" role="group" aria-label="选择目标 Agent">
-                  {agents.map(a => {
-                    const isActive = activeTargets.includes(a)
-                    const isInspecting = agent === a && activeTargets.length > 1
-                    const isBusy = busyAgents.has(a)
-                    return (
-                      <button
-                        key={a}
-                        type="button"
-                        className={'seg-btn ' + agentClass[a] + (isActive ? ' active' : '') + (isInspecting ? ' inspecting' : '')}
-                        onMouseEnter={() => { if (isActive) setInspected(a) }}
-                        onClick={e => toggleAgent(a, e.metaKey || e.shiftKey)}
-                        title={a + (isActive && activeTargets.length > 1 ? '（当前显示其配置 · 悬停或点击可切换查看）' : isBusy ? ' (执行中)' : ' · ⌘+点击可多选')}
-                      >
-                        <Icon name={a} size={15} />
-                        <span>{a}</span>
-                        {isBusy && <span className="pulse-dot mini" />}
-                      </button>
-                    )
-                  })}
-                  <button
-                    type="button"
-                    className={'seg-btn all' + (isAllMode ? ' active' : '')}
-                    onClick={toggleAll}
-                    title="全选 / 取消全选所有就绪 Agent (⌘4)"
-                  >
-                    <Users size={13} />
-                    <span>All</span>
-                  </button>
-                </div>
+                <TargetSelector
+                  members={agents}
+                  activeTargets={activeTargets}
+                  isAllMode={isAllMode}
+                  busyAgents={busyAgents}
+                  inspected={agent}
+                  onSelectSingle={a => toggleAgent(a, false)}
+                  onToggleMulti={a => toggleAgent(a, true)}
+                  onToggleAll={toggleAll}
+                  onInspect={setInspected}
+                  onOpenInvite={() => setMembersOpen(true)}
+                />
 
                 <div className="toolbar-mid">
                   <ModelEffortPicker

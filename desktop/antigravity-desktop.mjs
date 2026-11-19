@@ -13,6 +13,75 @@ const appPaths = ['/Applications/Antigravity.app', path.join(homedir(), 'Applica
 export const desktopApp = () => appPaths.find(dir => existsSync(path.join(dir, 'Contents/Resources/bin/language_server')))
 const registry = path.join(homedir(), '.gemini/antigravity/daemon')
 const projectRequests = new Map()
+const callbackWatchers = new Map()
+let watcherTimer = null
+
+const isTerminalStep = step => ['DONE','ERROR','CANCELED','INTERRUPTED','INVALID','CLEARED'].some(s => step.status?.endsWith('_' + s))
+
+async function pollCallbackWatchers() {
+  const now = Date.now()
+  for (const [cascadeId, w] of callbackWatchers) {
+    if (now > w.expiresAt) { callbackWatchers.delete(cascadeId); continue }
+    try {
+      const rpc = w.rpc || await findDesktop(w.app)
+      if (!rpc) continue
+      const summaries = (await rpc('GetAllCascadeTrajectories', {excludeSubtrajectories:true})).trajectorySummaries || {}
+      const summary = summaries[cascadeId]
+      if (!summary) { callbackWatchers.delete(cascadeId); continue }
+      const stepCount = Number(summary.stepCount || 0)
+      if (stepCount <= w.offset && w.settled.size === 0) continue
+      const startOffset = w.offset
+      const {steps = []} = await rpc('GetCascadeTrajectorySteps', {cascadeId, stepOffset:startOffset, trajectoryVerbosity:2})
+      let hitNewUser = false
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i], idx = startOffset + i
+        if (step.userInput) { hitNewUser = true; break }
+        if (w.settled.has(idx)) continue
+        if (!isTerminalStep(step)) continue
+        w.settled.add(idx)
+        const text = step.plannerResponse?.modifiedResponse || step.plannerResponse?.response || step.notifyUser?.notificationContent
+        if (text) {
+          w.onFollowup('text', '\n\n' + text)
+          w.expiresAt = Date.now() + 30 * 60 * 1000
+        }
+        if (!step.plannerResponse && !step.errorMessage) {
+          const name = step.metadata?.toolCall?.name || step.type?.replace('CORTEX_STEP_TYPE_', '').toLowerCase()
+          if (name) w.onFollowup('log', '::step::' + JSON.stringify({id:'ag-' + idx, kind:'tool', title:name, status:step.error?'error':'done'}))
+        }
+      }
+      while (w.settled.has(w.offset)) { w.settled.delete(w.offset); w.offset++ }
+      if (hitNewUser) callbackWatchers.delete(cascadeId)
+    } catch {}
+  }
+  if (callbackWatchers.size === 0 && watcherTimer) {
+    clearInterval(watcherTimer)
+    watcherTimer = null
+  }
+}
+
+export function watchDesktopCallbacks({app, cascadeId, offset, settled, onFollowup, rpc}) {
+  if (!cascadeId || typeof onFollowup !== 'function') return
+  callbackWatchers.set(cascadeId, {
+    app,
+    rpc,
+    offset,
+    settled: new Set(settled || []),
+    onFollowup,
+    expiresAt: Date.now() + 30 * 60 * 1000
+  })
+  if (!watcherTimer) {
+    watcherTimer = setInterval(() => { void pollCallbackWatchers() }, 2500)
+    watcherTimer.unref?.()
+  }
+}
+
+export function stopWatchingDesktopCallbacks(cascadeId) {
+  callbackWatchers.delete(cascadeId)
+  if (callbackWatchers.size === 0 && watcherTimer) {
+    clearInterval(watcherTimer)
+    watcherTimer = null
+  }
+}
 
 // The CLI publishes descriptors here too. Only use a listener owned by the installed desktop executable.
 async function findDesktop(app) {
@@ -99,6 +168,7 @@ async function modelFor(rpc, model, effort, signal) {
 }
 
 export async function runDesktopTurn({app, cwd, session, prompt, historyPrompt, title, images = [], model, effort, write, signal, emit, rpc}) {
+  if (session) stopWatchingDesktopCallbacks(session)
   rpc ??= await connect(app, signal)
   const selected = await modelFor(rpc, model, effort, signal)
   const summaries = async () => (await rpc('GetAllCascadeTrajectories', {excludeSubtrajectories:true}, signal)).trajectorySummaries || {}
@@ -134,9 +204,9 @@ export async function runDesktopTurn({app, cwd, session, prompt, historyPrompt, 
   const plannerConfig = {toolConfig, ...(selected ? {requestedModel:selected.modelOrAlias} : {})}
   const body = {cascadeId:id, clientMessageId:messageId, items:[{text:prompt}], media:images.map(x => ({mimeType:x.mimeType, inlineData:x.base64})),
     cascadeConfig:{plannerConfig}, customAgentSpec:{builtinAgent:{defaultAgent:{isGoogle:false, isInteractive:true, surface:'AGENT_SURFACE_HUB'}}}}
-  let sending = false, mine = false, output = false, nextUser = false, lastError = ''
+  let sending = false, mine = false, output = false, nextUser = false, lastError = '', idleConfirm = 0, lastSeenCount = -1
   const settled = new Set(), seenRunning = new Set()
-  const isTerminal = step => ['DONE','ERROR','CANCELED','INTERRUPTED','INVALID','CLEARED'].some(s => step.status?.endsWith('_' + s))
+  const isTerminal = isTerminalStep
   try {
     sending = true
     await rpc('SendUserCascadeMessage', body, signal)
@@ -176,13 +246,35 @@ export async function runDesktopTurn({app, cwd, session, prompt, historyPrompt, 
         }
       }
       while (settled.has(offset)) { settled.delete(offset); seenRunning.delete(offset); offset++ }
+      const stepCount = Number(summary.stepCount || 0)
       const fullyIdle = Boolean(summary.status?.endsWith('_IDLE') && !summary.notFullyIdle)
-      const reachedEnd = startOffset + steps.length >= Number(summary.stepCount || 0)
+      const reachedEnd = startOffset + steps.length >= stepCount
       if (!mine && fullyIdle && Date.now() - sentAt > 20000) throw Error('客户端未确认这条消息，请检查该项目的原生会话。')
-      if (nextUser || (mine && fullyIdle && reachedEnd && !pendingResponse)) break
+      if (nextUser) break
+      if (mine && fullyIdle && reachedEnd && !pendingResponse) {
+        if (seenRunning.size > 0 && (idleConfirm < 1 || stepCount !== lastSeenCount)) {
+          idleConfirm++
+          lastSeenCount = stepCount
+        } else {
+          break
+        }
+      } else {
+        idleConfirm = 0
+        lastSeenCount = stepCount
+      }
       await delay(750, null, {signal})
     }
     if (lastError || !output) throw Error(lastError || 'Antigravity 已结束本轮，未返回正文。')
+    if (!nextUser) {
+      watchDesktopCallbacks({
+        app,
+        cascadeId: id,
+        offset,
+        settled,
+        onFollowup: (type, value) => emit(type, value),
+        rpc: rpc
+      })
+    }
   } finally {
     if (signal.aborted && sending && !nextUser) {
       // Only stop our own turn; a new user message may already be running in the desktop.

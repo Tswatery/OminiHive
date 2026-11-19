@@ -54,7 +54,10 @@ function saveAttachments(images) {
 async function run(room, text, allowWrite, modelOrPrefs = '', effort = '', targetAgents = '', images = []) {
   const { agents: parsedAgents, isAll } = routeTargets(text, targetAgents)
   const avail = availability()
-  const agents = isAll ? parsedAgents.filter(a => avail[a]) : parsedAgents
+  const roomScope = Array.isArray(targetAgents) && targetAgents.length ? targetAgents : null
+  const agents = isAll
+    ? parsedAgents.filter(a => avail[a] && (!roomScope || roomScope.includes(a)))
+    : parsedAgents
   if (!agents.length) throw Error('未找到可用的 Agent CLI')
   const prefs = typeof modelOrPrefs === 'object' && modelOrPrefs !== null ? modelOrPrefs : null
   for (const agent of agents) {

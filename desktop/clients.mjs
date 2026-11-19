@@ -4,7 +4,8 @@ import { accessSync, constants, realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import {
-  managedCodex, managedGemini, managedOpenCode, managedQwen, managedOpenClaw, installClient
+  managedCodex, managedGemini, managedOpenCode, managedQwen, managedOpenClaw,
+  managedPi, managedDeepSeek, managedMiniMax, managedOhMyPi, installClient
 } from './upgrade.mjs'
 
 const run = promisify(execFile)
@@ -17,7 +18,13 @@ export const names = {
   Kimi: 'kimi',
   Qwen: 'qwen',
   OpenClaw: 'openclaw',
-  Grok: 'grok'
+  Grok: 'grok',
+  Hermes: 'hermes',
+  Pi: 'pi',
+  MiniMax: 'minimax',
+  DeepSeek: 'dsh',
+  OhMyPi: 'omp',
+  WorkBuddy: 'codebuddy'
 }
 
 export const installHints = {
@@ -28,20 +35,31 @@ export const installHints = {
   OpenCode: '通过 npm (opencode-ai) 安装',
   Kimi: '通过官方脚本 (code.kimi.com) 安装',
   Qwen: '通过 npm (@qwen-code/qwen-code) 安装',
-  OpenClaw: '通过 npm (openclaw) 安装',
-  Grok: '本机 Grok Build CLI'
+  OpenClaw: '通过 npm 安装',
+  Grok: '本机 Grok Build CLI',
+  Hermes: '安装时运行官方安装脚本',
+  Pi: '通过 npm 安装',
+  MiniMax: '安装时运行官方安装脚本，失败时改用 npm',
+  DeepSeek: '通过 npm (@deepseek-ai/dsh) 安装',
+  OhMyPi: '安装时运行官方安装脚本，失败时改用 npm',
+  WorkBuddy: '自动复用本机 WorkBuddy.app 内置 CLI 或独立 codebuddy CLI'
 }
 
 export const dirs = [
   path.join(homedir(), '.local/bin'),
   path.join(homedir(), '.kimi-code/bin'),
   path.join(homedir(), '.opencode/bin'),
+  path.join(homedir(), '.hermes/bin'),
+  path.join(homedir(), '.omp/bin'),
+  path.join(homedir(), '.bun/bin'),
+  path.join(homedir(), '.cargo/bin'),
   '/opt/homebrew/bin',
   '/usr/local/bin',
   ...(process.env.PATH || '').split(':').filter(path.isAbsolute)
 ]
 
 const bundled = 'ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex'
+const bundledWorkBuddy = 'WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs'
 const releases = {
   Codex: 'https://api.github.com/repos/openai/codex/releases/latest',
   Claude: 'https://downloads.claude.ai/claude-code-releases/latest',
@@ -49,7 +67,10 @@ const releases = {
   Gemini: 'https://registry.npmjs.org/@google/gemini-cli/latest',
   OpenCode: 'https://registry.npmjs.org/opencode-ai/latest',
   Qwen: 'https://registry.npmjs.org/@qwen-code/qwen-code/latest',
-  OpenClaw: 'https://registry.npmjs.org/openclaw/latest'
+  OpenClaw: 'https://registry.npmjs.org/openclaw/latest',
+  Pi: 'https://registry.npmjs.org/@mariozechner/pi-coding-agent/latest',
+  DeepSeek: 'https://registry.npmjs.org/@deepseek-ai/dsh/latest',
+  OhMyPi: 'https://registry.npmjs.org/@oh-my-pi/pi-coding-agent/latest'
 }
 
 let installed = {}, initial, checking, last = []
@@ -71,21 +92,36 @@ async function discover(agent) {
     candidates.unshift(managedCodex)
     candidates.push('/Applications/' + bundled, path.join(homedir(), 'Applications', bundled))
   }
+  if (agent === 'WorkBuddy') {
+    candidates.push('/Applications/' + bundledWorkBuddy, path.join(homedir(), 'Applications', bundledWorkBuddy))
+  }
   if (agent === 'Gemini') candidates.unshift(managedGemini)
   if (agent === 'OpenCode') candidates.unshift(managedOpenCode)
   if (agent === 'Qwen') candidates.unshift(managedQwen)
   if (agent === 'OpenClaw') candidates.unshift(managedOpenClaw)
+  if (agent === 'Pi') candidates.unshift(managedPi)
+  if (agent === 'DeepSeek') candidates.unshift(managedDeepSeek)
+  if (agent === 'MiniMax') candidates.unshift(managedMiniMax)
+  if (agent === 'OhMyPi') candidates.unshift(managedOhMyPi)
 
   const seen = new Set()
   const rows = await Promise.all(candidates.map(async file => {
     try {
-      accessSync(file, constants.X_OK)
+      const isMjs = file.endsWith('.mjs')
+      accessSync(file, isMjs ? constants.R_OK : constants.X_OK)
       const real = realpathSync(file)
       if (seen.has(real)) return
       seen.add(real)
-      const { stdout } = await run(file, ['--version'], { timeout: 4000, env: { ...process.env, PATH: dirs.join(':') } })
-      const current = version(stdout)
-      if (current) return { path: file, version: current }
+      try {
+        const execBin = isMjs ? process.execPath : file
+        const execArgs = isMjs ? [file, '--version'] : ['--version']
+        const execEnv = { ...process.env, PATH: dirs.join(':'), ...(isMjs ? { ELECTRON_RUN_AS_NODE: '1' } : {}) }
+        const { stdout, stderr } = await run(execBin, execArgs, { timeout: 4000, env: execEnv })
+        const current = version(stdout || stderr || '')
+        return { path: file, version: current || '0.0.0' }
+      } catch {
+        return { path: file, version: '0.0.0' }
+      }
     } catch {}
   }))
   return rows.filter(Boolean).sort((a, b) => compare(b.version, a.version))
@@ -106,7 +142,7 @@ function clientRow(agent) {
   return {
     agent,
     hint: installHints[agent],
-    canInstall: agent !== 'Antigravity' && agent !== 'Grok',
+    canInstall: agent !== 'Antigravity' && agent !== 'Grok' && agent !== 'WorkBuddy',
     candidates,
     ...check,
     status,

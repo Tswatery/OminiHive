@@ -12,13 +12,21 @@ export const managedGemini = path.join(privateDir, 'gemini')
 export const managedOpenCode = path.join(privateDir, 'opencode')
 export const managedQwen = path.join(privateDir, 'qwen')
 export const managedOpenClaw = path.join(privateDir, 'openclaw')
+export const managedPi = path.join(privateDir, 'pi')
+export const managedDeepSeek = path.join(privateDir, 'dsh')
+export const managedMiniMax = path.join(privateDir, 'minimax')
+export const managedOhMyPi = path.join(privateDir, 'omp')
 
 const NPM_SPECS = {
   Codex: { pkg: '@openai/codex', bin: 'codex', dest: managedCodex },
   Gemini: { pkg: '@google/gemini-cli', bin: 'gemini', dest: managedGemini },
   OpenCode: { pkg: 'opencode-ai', bin: 'opencode', dest: managedOpenCode },
   Qwen: { pkg: '@qwen-code/qwen-code', bin: 'qwen', dest: managedQwen },
-  OpenClaw: { pkg: 'openclaw', bin: 'openclaw', dest: managedOpenClaw }
+  OpenClaw: { pkg: 'openclaw', bin: 'openclaw', dest: managedOpenClaw },
+  Pi: { pkg: '@mariozechner/pi-coding-agent', bin: 'pi', dest: managedPi },
+  DeepSeek: { pkg: '@deepseek-ai/dsh', bin: 'dsh', dest: managedDeepSeek },
+  MiniMax: { pkg: '@minimax-ai/minimax-code', bin: 'minimax', dest: managedMiniMax },
+  OhMyPi: { pkg: '@oh-my-pi/pi-coding-agent', bin: 'omp', dest: managedOhMyPi }
 }
 
 async function findNpm(envPath) {
@@ -51,6 +59,23 @@ async function installNpmPackage(agent, target, options) {
 export async function installClient(agent, executable, target, dirs) {
   if (target && !/^\d+\.\d+\.\d+(?:-[\w.-]+)?$/.test(target)) throw Error('无效的发布版本')
   const options = { timeout: 300000, maxBuffer: 4 * 1024 * 1024, cwd: homedir(), env: { ...process.env, PATH: dirs.join(':'), CI: '1', NO_COLOR: '1' } }
+  if (agent === 'Hermes') {
+    return run('/bin/bash', ['-c', 'curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash'], options)
+  }
+  if (agent === 'OhMyPi') {
+    try {
+      return await run('/bin/bash', ['-c', 'curl -fsSL https://omp.sh/install | sh'], options)
+    } catch {
+      return installNpmPackage(agent, target, options)
+    }
+  }
+  if (agent === 'MiniMax') {
+    try {
+      return await run('/bin/bash', ['-c', 'curl -fsSL https://code.minimax.io/install.sh | bash'], options)
+    } catch {
+      return installNpmPackage(agent, target, options)
+    }
+  }
   if (NPM_SPECS[agent]) return installNpmPackage(agent, target, options)
   if (agent === 'Claude') {
     if (executable) return run(executable, ['install', target || 'latest'], options)

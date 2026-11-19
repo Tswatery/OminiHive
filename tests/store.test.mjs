@@ -11,7 +11,8 @@ test('提及路由拒绝空任务和未知客户端',()=>{
 test('无前缀路由、群发与讨论管理',()=>{
   assert.deepEqual(routeTargets('帮我看下架构','Claude'),{agents:['Claude'],task:'帮我看下架构',isAll:false})
   assert.deepEqual(routeTargets('@codex @claude @Codex 联合评审','Antigravity'),{agents:['Codex','Claude'],task:'联合评审',isAll:false})
-  assert.deepEqual(routeTargets('@all 你怎么看','Codex'),{agents:['Codex','Claude','Antigravity','Gemini','OpenCode','Kimi','Qwen','OpenClaw','Grok'],task:'你怎么看',isAll:true})
+  assert.deepEqual(routeTargets('@all 你怎么看','Codex'),{agents:['Codex','Claude','Antigravity','Gemini','OpenCode','Kimi','Qwen','OpenClaw','Grok','Hermes','Pi','MiniMax','DeepSeek','OhMyPi','WorkBuddy'],task:'你怎么看',isAll:true})
+  assert.deepEqual(routeTargets('@DeepSeek @Hermes @OhMyPi @WorkBuddy 一起看下','Codex'),{agents:['DeepSeek','Hermes','OhMyPi','WorkBuddy'],task:'一起看下',isAll:false})
   assert.deepEqual(routeTargets('你怎么看 @Antigravity @codex','Claude'),{agents:['Antigravity','Codex'],task:'你怎么看 @Antigravity @codex',isAll:false})
   assert.throws(()=>routeTargets('@Codex   ','Codex'))
   const base=mkdtempSync(path.join(tmpdir(),'hive-batch-'))
