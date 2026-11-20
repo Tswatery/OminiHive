@@ -1,7 +1,7 @@
 import {randomUUID} from 'node:crypto'
 import { promisify } from 'node:util'
 import { spawn,execFile } from 'node:child_process'
-import { existsSync, readFileSync, accessSync, constants } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync, accessSync, constants } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { createInterface } from 'node:readline'
@@ -10,8 +10,18 @@ import {names,dirs,binary,initClients} from './clients.mjs'
 import {desktopApp,runDesktopTurn} from './antigravity-desktop.mjs'
 import {antigravityEnv} from './antigravity-env.mjs'
 import {resolveProviderConfig,prepareCodexHome,legacyCodexRollout} from './ccswitch.mjs'
+import {EFFORT_LEVELS,isValidEffort,normalizeModelEfforts,applyReasoningEffort} from './reasoning.mjs'
+import {createStepAdapter} from './step-tracker.mjs'
 export {availability} from './clients.mjs'
-const ordered=['minimal','low','medium','high','xhigh','max','ultra']
+const ordered=EFFORT_LEVELS
+const pendingInteractions=new Map()
+
+export function respondAgentInteraction(req){
+  const key=req?.interactionId||req?.cascadeId||''
+  const entry=key?pendingInteractions.get(key):null
+  if(!entry)return false
+  return entry.respond(req?.payload||{})
+}
 export function gravityModels(text){
   const families=new Map()
   for(const line of text.trim().split(/\r?\n/)){
@@ -33,6 +43,10 @@ function claudeModels(env){
   })
 }
 export async function modelList(agent,cwd){
+  const list = await loadRawModelList(agent,cwd)
+  return normalizeModelEfforts(agent,list)
+}
+async function loadRawModelList(agent,cwd){
   await initClients()
   if(!Object.hasOwn(names,agent)||!binary(agent))throw Error('未找到本机客户端')
   if(agent==='Claude'){
@@ -64,26 +78,126 @@ export async function modelList(agent,cwd){
   if(agent==='Hermes')return [{id:'',label:'跟随 Hermes 默认配置',efforts:[],isDefault:true}]
   if(agent==='Pi')return [{id:'',label:'跟随 Pi 默认配置',efforts:[],isDefault:true}]
   if(agent==='MiniMax')return [{id:'',label:'跟随 MiniMax 默认配置',efforts:[],isDefault:true}]
-  if(agent==='DeepSeek')return [{id:'',label:'跟随 DeepSeek Harness 默认配置',efforts:[],isDefault:true}]
-  if(agent==='OhMyPi')return [{id:'',label:'跟随 Oh My Pi 默认配置',efforts:[],isDefault:true}]
+  if(agent==='DeepSeek'){
+    const out=[]
+    const seen=new Set()
+    const pushModel=(id,label,isDefault=false)=>{
+      if(!id||seen.has(id))return
+      seen.add(id)
+      out.push({id,label:label||id,efforts:[],isDefault})
+    }
+    try{
+      let defaultModel=''
+      const profiles=['headless','web','desktop']
+      for(const prof of profiles){
+        const p=path.join(homedir(),'.dsh','profiles',prof,'cordis.patch.yml')
+        if(!existsSync(p))continue
+        const raw=readFileSync(p,'utf8')
+        const defBlock=raw.match(/-\s*id:\s*agent-default-model[\s\S]*?(?=\n-\s*id:|\s*$)/)?.[0]||''
+        const dm=defBlock.match(/^\s*model:\s*['"]?([^\s'"#]+)['"]?/m)?.[1]||''
+        if(dm && !defaultModel)defaultModel=dm
+        const llmBlock=raw.match(/-\s*id:\s*llm-pi-ai[\s\S]*?(?=\n-\s*id:|\s*$)/)?.[0]||''
+        for(const m of llmBlock.matchAll(/^[ \t]+-\s*id:\s*['"]?([^\s'"#]+)['"]?(?:\r?\n[ \t]+name:\s*['"]?([^\r\n'"#]+)['"]?\s*)?/gm)){
+          const id=m[1].trim()
+          const name=(m[2]||id).trim()
+          pushModel(id,name,id===defaultModel)
+        }
+        if(defaultModel && !seen.has(defaultModel))pushModel(defaultModel,defaultModel,true)
+        if(out.length)break
+      }
+      if(out.length){
+        if(!out.some(m=>m.isDefault))out[0].isDefault=true
+        return out
+      }
+    }catch{}
+    return [{id:'',label:'跟随 DeepSeek Harness 默认配置',efforts:[],isDefault:true}]
+  }
+  if(agent==='OhMyPi'){
+    const ompEfforts=['off','low','medium','high','xhigh','max']
+    const out=[]
+    const seen=new Set()
+    const pushModel=(id,label,isDefault=false)=>{
+      if(!id||seen.has(id))return
+      seen.add(id)
+      out.push({id,label:label||id,efforts:ompEfforts,isDefault})
+    }
+    try{
+      const ompDir=path.join(homedir(),'.omp','agent')
+      const cfgPath=path.join(ompDir,'config.yml')
+      const modelsPath=path.join(ompDir,'models.yml')
+      let defaultSpec=''
+      if(existsSync(cfgPath)){
+        const cfg=readFileSync(cfgPath,'utf8')
+        const roleBlock=cfg.match(/^modelRoles:\s*\r?\n((?:[ \t]+.*\r?\n?)*)/m)?.[1]||''
+        defaultSpec=roleBlock.match(/^\s*default:\s*['"]?([^\s'"#]+)['"]?/m)?.[1]||''
+      }
+      const shortOf=spec=>spec.includes('/')?spec.split('/').slice(1).join('/'):spec
+      if(existsSync(modelsPath)){
+        const raw=readFileSync(modelsPath,'utf8')
+        let curProvider=''
+        for(const line of raw.split(/\r?\n/)){
+          const pm=line.match(/^  ([A-Za-z0-9._-]+):\s*$/)
+          if(pm){curProvider=pm[1];continue}
+          const mm=line.match(/^\s*-\s*id:\s*['"]?([^\s'"#]+)['"]?/)
+          if(mm){
+            const rawId=mm[1].trim()
+            const fullId=curProvider&&!rawId.includes('/')?`${curProvider}/${rawId}`:rawId
+            const isDef=Boolean(defaultSpec&&(fullId===defaultSpec||rawId===defaultSpec||rawId===shortOf(defaultSpec)))
+            pushModel(fullId,rawId,isDef)
+          }
+        }
+      }
+      if(defaultSpec && !out.some(m=>m.isDefault)){
+        pushModel(defaultSpec,shortOf(defaultSpec),true)
+      }
+      if(out.length){
+        if(!out.some(m=>m.isDefault))out[0].isDefault=true
+        return out
+      }
+    }catch{}
+    return [{id:'',label:'跟随 Oh My Pi 默认配置',efforts:ompEfforts,isDefault:true}]
+  }
   if(agent==='WorkBuddy'){
+    const out=[{id:'',label:'Auto (WorkBuddy 默认)',efforts:[],isDefault:true}]
+    const seen=new Set(['','auto'])
+    try{
+      const cacheDir=path.join(homedir(),'.workbuddy','cache')
+      if(existsSync(cacheDir)){
+        const files=readdirSync(cacheDir)
+          .filter(f=>/^acc-product-config-v3-.*\.json$/.test(f))
+          .map(f=>({f:path.join(cacheDir,f),t:statSync(path.join(cacheDir,f)).mtimeMs}))
+          .sort((a,b)=>b.t-a.t)
+        for(const item of files){
+          try{
+            const cfg=JSON.parse(readFileSync(item.f,'utf8'))
+            const nameMap=new Map((Array.isArray(cfg.models)?cfg.models:[]).map(m=>[m.id,m.name||m.displayName||m.id]))
+            const cliAgent=Array.isArray(cfg.agents)?(cfg.agents.find(a=>a.name==='cli'||a.tags?.includes('default'))||cfg.agents[0]):null
+            const orderedIds=Array.isArray(cliAgent?.models)&&cliAgent.models.length?cliAgent.models:[...nameMap.keys()]
+            for(const id of orderedIds){
+              if(!id||seen.has(id))continue
+              seen.add(id)
+              out.push({id,label:nameMap.get(id)||id,efforts:[],isDefault:false})
+            }
+            if(out.length>1)return out
+          }catch{}
+        }
+      }
+    }catch{}
     const exe=binary(agent)
     try{
       const isMjs=exe.endsWith('.mjs')
       const {stdout}=await promisify(execFile)(isMjs?process.execPath:exe,isMjs?[exe,'--help']:['--help'],{timeout:5000,env:{...process.env,PATH:dirs.join(':'),...(isMjs?{ELECTRON_RUN_AS_NODE:'1'}:{})}})
       const raw=stdout.match(/Currently supported:\s*\(([^)]+)\)/i)?.[1]
       if(raw){
-        const ids=raw.split(',').map(s=>s.trim()).filter(Boolean)
-        if(ids.length)return ids.map((id,i)=>({id:id==='auto'?'':id,label:id==='auto'?'Auto (WorkBuddy 默认)':id,efforts:[],isDefault:i===0}))
+        for(const id of raw.split(',').map(s=>s.trim()).filter(Boolean)){
+          if(seen.has(id))continue
+          seen.add(id)
+          out.push({id,label:id,efforts:[],isDefault:false})
+        }
+        if(out.length>1)return out
       }
     }catch{}
-    return [
-      {id:'',label:'Auto (WorkBuddy 默认)',efforts:[],isDefault:true},
-      {id:'glm-5.1',label:'glm-5.1',efforts:[]},
-      {id:'kimi-k2.5',label:'kimi-k2.5',efforts:[]},
-      {id:'minimax-m2.7',label:'minimax-m2.7',efforts:[]},
-      {id:'deepseek-v3-2-volc',label:'deepseek-v3-2-volc',efforts:[]}
-    ]
+    return out
   }
   const {stdout}=await promisify(execFile)(binary(agent),['models'],{cwd,timeout:16000,env:await antigravityEnv({...process.env,PATH:dirs.join(':')})})
   return gravityModels(stdout)
@@ -108,7 +222,9 @@ function claudeConfig(env,args,model,provider=null) {
   return role
 }
 
-export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],session,write=false,signal,emit,model='',effort='',providerId='',catalogOnly=false}) {
+export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],session,write=false,access='',signal,emit,model='',effort='',providerId='',catalogOnly=false}) {
+  const accessMode = (access === 'read-only' || access === 'workspace' || access === 'full') ? access : (write ? 'workspace' : 'read-only')
+  write = accessMode !== 'read-only'
   await initClients()
   if(effort&&!ordered.includes(effort))throw Error('未知的思考强度')
   const exe=binary(agent)
@@ -138,7 +254,7 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
     for(const [k,v] of Object.entries(provider.cfg.env)) if(typeof v==='string')env[k]=v
   }
   let args=codex ? ['app-server','--stdio'] : (write ? ['acp','--dangerously-skip-permissions'] : ['--sandbox','acp'])
-  const imgPrompt=images.length?prompt+'\n\n[附带图片路径：\n'+images.map(i=>i.path).join('\n')+'\n]':prompt
+  const imgPrompt=images.length?prompt+'\n\n[附带文件路径：\n'+images.map(i=>i.path).join('\n')+'\n]':prompt
   if(gemini){
     args=['-p',imgPrompt,'--output-format','stream-json']
     if(write)args.push('--yolo')
@@ -176,7 +292,7 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
     if(model)args.push('--model',model)
   }
   if(pi || ohMyPi){
-    args=['-p',imgPrompt]
+    args=['-p','--mode','json',imgPrompt]
     if(model)args.push('--model',model)
   }
   if(minimax){
@@ -188,17 +304,18 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
     if(model)args.push('--model',model)
   }
   if(claude) {
-    args=['-p','--verbose','--output-format','stream-json','--include-partial-messages','--restricted','--strict-mcp-config','--permission-mode',write?'acceptEdits':'dontAsk','--tools',write?'Read,Glob,Grep,Edit,Write':'Read,Glob,Grep']
+    args=['-p','--verbose','--output-format','stream-json','--include-partial-messages','--permission-mode',accessMode==='full'?'bypassPermissions':(write?'acceptEdits':'dontAsk')]
+    if(accessMode!=='full') args.push('--restricted','--strict-mcp-config','--tools',write?'Read,Glob,Grep,Edit,Write':'Read,Glob,Grep')
     if(images.length){
       const dirsSet=new Set(images.map(i=>path.dirname(i.path)))
       for(const d of dirsSet)args.push('--add-dir',d)
     }
     claudeConfig(env,args,model,provider)
-    if(effort)args.push('--effort',effort)
     if(session) args.push('--resume',session)
   }
   if(workbuddy) {
-    args=['-p','--verbose','--output-format','stream-json','--include-partial-messages','--permission-mode',write?'acceptEdits':'dontAsk','--tools',write?'Read,Glob,Grep,Edit,Write':'Read,Glob,Grep']
+    args=['-p','--verbose','--output-format','stream-json','--include-partial-messages','--permission-mode',accessMode==='full'?'bypassPermissions':(write?'acceptEdits':'dontAsk')]
+    if(accessMode!=='full') args.push('--tools',write?'Read,Glob,Grep,Edit,Write':'Read,Glob,Grep')
     if(images.length){
       const dirsSet=new Set(images.map(i=>path.dirname(i.path)))
       for(const d of dirsSet)args.push('--add-dir',d)
@@ -206,6 +323,7 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
     if(model)args.push('--model',model)
     if(session)args.push('--resume',session)
   }
+  if(effort && !codex) applyReasoningEffort({agent,effort,args,env,emit})
   const isMjsExe = exe.endsWith('.mjs')
   const spawnCmd = isMjsExe ? process.execPath : exe
   const spawnArgs = isMjsExe ? [exe, ...args] : args
@@ -213,7 +331,8 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
   const child=spawn(spawnCmd,spawnArgs,{cwd,env:agent==='Antigravity'?await antigravityEnv(env):env,stdio:'pipe',detached:true})
   const lines=createInterface({input:child.stdout})
   const pending=new Map()
-  let seq=0, failure, stderr='', finish, output='', currentItem='', deltas='', active=false, thoughtBuf='', lastThoughtEmit=0, closed=false, codexThreadId=''
+  const runInteractionIds=new Set()
+  let seq=0, failure, stderr='', finish, output='', currentItem='', deltas='', active=false, thoughtBuf='', lastThoughtEmit=0, closed=false, codexThreadId='', codexTurnId=''
   const exited=new Promise(resolve=>{child.once('close',()=>{closed=true;resolve()})})
   const done=new Promise((resolve,reject)=>{ finish=err=>err?reject(err):resolve() })
   done.catch(()=>{})
@@ -232,36 +351,100 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
     return new Promise((resolve,reject)=>{pending.set(id,{resolve,reject});send({id,method,params})})
   }
   function emitStep(step){emit('log','::step::'+JSON.stringify(step))}
+  function extractToolResultText(content){
+    if(typeof content==='string')return content
+    if(Array.isArray(content)){
+      return content.map(item=>{
+        if(typeof item==='string')return item
+        if(item && typeof item==='object'){
+          if(typeof item.text==='string')return item.text
+          if(typeof item.content==='string')return item.content
+          if(item.type==='image')return '[图片]'
+          try{return JSON.stringify(item)}catch{return ''}
+        }
+        return ''
+      }).filter(Boolean).join('\n')
+    }
+    if(content && typeof content==='object'){
+      try{return JSON.stringify(content,null,2)}catch{return ''}
+    }
+    return ''
+  }
+  function summarizeToolTitle(name,input){
+    const toolName=name||'调用工具'
+    if(!input || typeof input!=='object')return toolName
+    const file=input.file_path||input.path||input.notebook_path||input.target_file
+    const cmd=input.command||input.cmd
+    const pattern=input.pattern||input.query||input.regex||input.glob
+    const url=input.url
+    let hint=''
+    if(typeof cmd==='string'&&cmd.trim())hint=cmd.trim().replace(/\s+/g,' ')
+    else if(typeof file==='string'&&file.trim())hint=file.trim()
+    else if(typeof pattern==='string'&&pattern.trim())hint=pattern.trim()+(typeof input.path==='string'&&input.path.trim()?` (${input.path.trim()})`:'')
+    else if(typeof url==='string'&&url.trim())hint=url.trim()
+    else {
+      for(const v of Object.values(input)){
+        if(typeof v==='string'&&v.trim()){hint=v.trim().replace(/\s+/g,' ');break}
+      }
+    }
+    if(!hint)return toolName
+    return `${toolName} · ${hint.length>68?hint.slice(0,68)+'…':hint}`
+  }
+  function formatToolInput(input){
+    if(input==null)return ''
+    if(typeof input==='string')return input.trim()
+    try{
+      const json=JSON.stringify(input,null,2)
+      return json==='{}'?'':json
+    }catch{return ''}
+  }
+  const toolSteps=new Map()
+  const blockIndexToToolId=new Map()
+  const codexReasonBuf=new Map()
+  let claudeThinkSeq=0, claudeThinkId='', claudeThinkBuf='', lastClaudeThinkEmit=0, claudeThinkActive=false
+  function finishClaudeThink(){
+    if(!claudeThinkActive || !claudeThinkId)return
+    claudeThinkActive=false
+    const detail=claudeThinkBuf.trim()
+    emitStep({id:claudeThinkId,kind:'thought',title:'思考过程',status:'done',detail:detail?detail.slice(-2000):undefined})
+  }
   if(provider)emitStep({id:'meta-provider',kind:'info',title:'渠道 · '+provider.name,status:'done'})
   function append(s){if(s){output+=s;emit('text',s)}}
+  const usesStepAdapter = opencode || qwen || openclaw || grok || extraSimpleCli
+  const stepAdapter = usesStepAdapter ? createStepAdapter(agent, { emit, append, fail }) : null
+  if (stepAdapter && (openclaw || grok || hermes || minimax || deepseek)) {
+    child.stderr.on('data', data => stepAdapter.onStderrChunk(data))
+  }
   lines.on('line',line=>{
+    if(stepAdapter){
+      stepAdapter.handleLine(line)
+      return
+    }
     if(gemini || kimi){
       let e; try{e=JSON.parse(line)}catch{if(line.trim())append(line+'\n');return}
       if(e.session_id)emit('session',e.session_id)
       if(e.type==='message'&&e.role==='assistant'&&e.content)append(e.content)
       else if(e.content&&typeof e.content==='string'&&e.role==='assistant')append(e.content)
       if(e.delta?.text)append(e.delta.text)
-      if(e.type==='tool_use')emitStep({id:e.tool_id||e.tool_name||'tool',kind:'tool',title:e.tool_name||'调用工具',status:'running'})
-      if(e.type==='tool_result')emitStep({id:e.tool_id||'tool',kind:'tool',title:e.tool_name||'工具完成',status:e.status==='error'?'error':'done'})
+      if(e.type==='tool_use'){
+        const tid=e.tool_id||e.tool_name||'tool'
+        const input=e.parameters??e.input??e.arguments
+        const title=summarizeToolTitle(e.tool_name||'调用工具',input)
+        const inStr=formatToolInput(input)
+        toolSteps.set(tid,{id:tid,name:e.tool_name||'调用工具',title,inStr})
+        emitStep({id:tid,kind:'tool',title,status:'running',detail:inStr?`输入：\n${inStr.slice(0,800)}`:undefined})
+      }
+      if(e.type==='tool_result'){
+        const tid=e.tool_id||'tool'
+        const prev=toolSteps.get(tid)
+        const title=prev?.title||e.tool_name||'工具完成'
+        const outStr=extractToolResultText(e.output??e.content??e.result).trim()
+        const parts=[]
+        if(prev?.inStr)parts.push('输入：\n'+prev.inStr.slice(0,800))
+        if(outStr)parts.push('返回：\n'+outStr.slice(-1200))
+        emitStep({id:tid,kind:'tool',title,status:e.status==='error'?'error':'done',detail:parts.length?parts.join('\n\n'):undefined})
+      }
       if(e.type==='result'&&e.response&&!output)append(e.response)
-      return
-    }
-    if(opencode){
-      let e;try{e=JSON.parse(line)}catch{return}
-      if(e.sessionID)emit('session',e.sessionID)
-      if(e.type==='text' && typeof e.part?.text==='string')append(e.part.text)
-      if(e.type==='error')fail(Error(e.error?.data?.message||'OpenCode 执行失败'))
-      return
-    }
-    if(qwen){
-      let e;try{e=JSON.parse(line)}catch{return}
-      if(e.session_id)emit('session',e.session_id)
-      if(e.type==='assistant')for(const block of e.message?.content||[])if(block.type==='text')append(block.text)
-      if(e.type==='result'&&!output&&typeof e.result==='string')append(e.result)
-      return
-    }
-    if(openclaw || grok || extraSimpleCli){
-      append(line+'\n')
       return
     }
     let e; try{e=JSON.parse(line)}catch{return}
@@ -269,20 +452,99 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
     if(claude || workbuddy){
       if(e.type==='system'&&e.subtype==='init'){emit('session',e.session_id);if(e.model)emitStep({id:'meta-model',kind:'info',title:'模型 · '+e.model,status:'done'})}
       const block=e.event
-      if(block?.type==='content_block_start'&&block.content_block?.type==='thinking'){emitStep({id:'claude-think',kind:'thought',title:'思考中',status:'running'})}
+      if(block?.type==='content_block_start'&&block.content_block?.type==='thinking'){
+        claudeThinkId='claude-think-'+(++claudeThinkSeq)
+        claudeThinkBuf=typeof block.content_block.thinking==='string'?block.content_block.thinking:''
+        claudeThinkActive=true
+        lastClaudeThinkEmit=Date.now()
+        emitStep({id:claudeThinkId,kind:'thought',title:'思考中',status:'running',detail:claudeThinkBuf?claudeThinkBuf.slice(-2000):undefined})
+      }
+      if(block?.type==='content_block_start'&&block.content_block?.type==='tool_use'){
+        finishClaudeThink()
+        const tid=block.content_block.id||('tool-'+block.index)
+        const name=block.content_block.name||'调用工具'
+        const initInput=block.content_block.input
+        const inStr=formatToolInput(initInput)
+        const title=summarizeToolTitle(name,initInput)
+        toolSteps.set(tid,{id:tid,name,inputJson:'',title,inStr})
+        if(block.index!=null)blockIndexToToolId.set(block.index,tid)
+        emitStep({id:tid,kind:'tool',title,status:'running',detail:inStr?`输入：\n${inStr.slice(0,800)}`:undefined})
+      }
       if(block?.type==='content_block_delta'){
+        if(typeof block.delta?.thinking==='string' && block.delta.thinking){
+          if(!claudeThinkActive){
+            claudeThinkId='claude-think-'+(++claudeThinkSeq)
+            claudeThinkBuf=''
+            claudeThinkActive=true
+          }
+          claudeThinkBuf=(claudeThinkBuf+block.delta.thinking).slice(-3000)
+          const now=Date.now()
+          if(now-lastClaudeThinkEmit>300){
+            lastClaudeThinkEmit=now
+            emitStep({id:claudeThinkId,kind:'thought',title:'思考中',status:'running',detail:claudeThinkBuf.slice(-2000)})
+          }
+        }
+        if(typeof block.delta?.partial_json==='string' && block.index!=null){
+          const tid=blockIndexToToolId.get(block.index)
+          const st=tid?toolSteps.get(tid):null
+          if(st)st.inputJson=(st.inputJson+block.delta.partial_json).slice(0,4000)
+        }
         if(block.delta?.text){
-          if(!output)emitStep({id:'claude-think',kind:'thought',title:'思考完成',status:'done'})
+          finishClaudeThink()
           append(block.delta.text)
         }
       }
-      if(block?.content_block?.type==='tool_use')emitStep({id:block.content_block.id||('tool-'+block.index),kind:'tool',title:block.content_block.name,status:'running'})
-      if(e.type==='user'&&Array.isArray(e.message?.content)){
+      if(block?.type==='content_block_stop'){
+        if(claudeThinkActive && (block.index==null || !blockIndexToToolId.has(block.index))){
+          finishClaudeThink()
+        }
+        if(block.index!=null && blockIndexToToolId.has(block.index)){
+          const tid=blockIndexToToolId.get(block.index)
+          const st=tid?toolSteps.get(tid):null
+          if(st && st.inputJson){
+            try{
+              const parsed=JSON.parse(st.inputJson)
+              st.title=summarizeToolTitle(st.name,parsed)
+              st.inStr=formatToolInput(parsed)
+              emitStep({id:tid,kind:'tool',title:st.title,status:'running',detail:st.inStr?`输入：\n${st.inStr.slice(0,800)}`:undefined})
+            }catch{}
+          }
+        }
+      }
+      if(e.type==='assistant'&&Array.isArray(e.message?.content)){
         for(const c of e.message.content){
-          if(c.type==='tool_result')emitStep({id:c.tool_use_id,kind:'tool',title:'工具返回',status:c.is_error?'error':'done',detail:typeof c.content==='string'?c.content.slice(-600):''})
+          if(c.type==='thinking' && typeof c.thinking==='string' && c.thinking.trim()){
+            const tid=claudeThinkId||('claude-think-'+(++claudeThinkSeq))
+            claudeThinkActive=false
+            claudeThinkBuf=c.thinking
+            emitStep({id:tid,kind:'thought',title:'思考过程',status:'done',detail:c.thinking.trim().slice(-2000)})
+          }
+          if(c.type==='tool_use'){
+            const tid=c.id||('tool-'+c.name)
+            const title=summarizeToolTitle(c.name,c.input)
+            const inStr=formatToolInput(c.input)
+            toolSteps.set(tid,{id:tid,name:c.name||'调用工具',inputJson:'',title,inStr})
+            emitStep({id:tid,kind:'tool',title,status:'running',detail:inStr?`输入：\n${inStr.slice(0,800)}`:undefined})
+          }
+        }
+      }
+      if(e.type==='user'&&Array.isArray(e.message?.content)){
+        claudeThinkId=''
+        for(const c of e.message.content){
+          if(c.type==='tool_result'){
+            const tid=c.tool_use_id||'tool-result'
+            const prev=toolSteps.get(tid)
+            const title=prev?.title||'工具调用'
+            const outStr=extractToolResultText(c.content).trim()
+            const parts=[]
+            if(prev?.inStr)parts.push('输入：\n'+prev.inStr.slice(0,800))
+            if(outStr)parts.push('返回：\n'+outStr.slice(-1400))
+            emitStep({id:tid,kind:'tool',title,status:c.is_error?'error':'done',detail:parts.length?parts.join('\n\n'):undefined})
+          }
         }
       }
       if(e.type==='result'){
+        finishClaudeThink()
         if(e.is_error)fail(Error(e.result||e.errors?.join('\n')||(workbuddy?'WorkBuddy 执行失败':'Claude 执行失败')))
         else {if(!output)append(e.result);finish()}
       }
@@ -301,6 +563,124 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
         const title=e.params?.toolCall?.title||'操作'
         emitStep({id:'perm-'+(e.params?.toolCall?.toolCallId||e.id),kind:'info',title:'权限请求已自动取消（只读模式）：'+title,status:'error'})
         send({id:e.id,result:{outcome:{outcome:'cancelled'}}})
+      } else if (e.method==='item/tool/requestUserInput') {
+        const questions = Array.isArray(e.params?.questions) ? e.params.questions : []
+        if (!questions.length) {
+          send({ id: e.id, result: { answers: {} } })
+          return
+        }
+        const collected = {}
+        const showQuestion = (qIdx) => {
+          const q = questions[qIdx]
+          const qId = String(q?.id || ('q-' + qIdx))
+          const stepId = `codex-ask-${e.id}-${qIdx}`
+          const interactionId = `codex-ask-${randomUUID()}`
+          const rawOpts = Array.isArray(q?.options) ? q.options : []
+          const options = rawOpts.map((opt, oi) => ({
+            id: `opt-${oi}`,
+            label: String(opt?.label || opt || `选项 ${oi + 1}`),
+            description: typeof opt?.description === 'string' ? opt.description : undefined,
+            payload: { answer: String(opt?.label || opt || '') }
+          }))
+          const headerText = String(q?.header || '').trim()
+          const questionText = String(q?.question || headerText || 'Codex 需要你的选择').trim()
+          const stepTitle = headerText
+            ? `${headerText}${questions.length > 1 ? ` (${qIdx + 1}/${questions.length})` : ''}`
+            : `需要你的回复${questions.length > 1 ? ` (${qIdx + 1}/${questions.length})` : ''}`
+          runInteractionIds.add(interactionId)
+          pendingInteractions.set(interactionId, {
+            respond(payload) {
+              const ans = typeof payload?.answer === 'string' ? payload.answer.trim() : ''
+              if (!ans) return false
+              pendingInteractions.delete(interactionId)
+              runInteractionIds.delete(interactionId)
+              collected[qId] = { answers: [ans] }
+              emitStep({
+                id: stepId,
+                kind: 'tool',
+                title: stepTitle,
+                status: 'done',
+                detail: `${questionText}\n\n已回复：${ans}`,
+                interaction: null
+              })
+              if (qIdx + 1 < questions.length) {
+                showQuestion(qIdx + 1)
+              } else {
+                try { send({ id: e.id, result: { answers: collected } }) } catch {}
+              }
+              return true
+            }
+          })
+          emitStep({
+            id: stepId,
+            kind: 'tool',
+            title: stepTitle,
+            status: 'waiting',
+            interaction: {
+              provider: 'Codex',
+              interactionId,
+              cascadeId: interactionId,
+              stepIndex: qIdx,
+              kind: 'question',
+              title: questionText,
+              allowCustom: true,
+              options
+            }
+          })
+        }
+        showQuestion(0)
+      } else if (e.method==='item/commandExecution/requestApproval' || e.method==='item/fileChange/requestApproval') {
+        if (accessMode === 'full') {
+          send({ id: e.id, result: { decision: 'accept' } })
+          return
+        }
+        const isCmd = e.method === 'item/commandExecution/requestApproval'
+        const stepId = `codex-approval-${e.id}`
+        const interactionId = `codex-approval-${randomUUID()}`
+        const target = isCmd
+          ? String(e.params?.command || e.params?.parsedCmd || '')
+          : String(e.params?.grantRoot || e.params?.path || '')
+        const reason = String(e.params?.reason || '')
+        const title = isCmd ? 'Codex 请求执行命令' : 'Codex 请求修改文件'
+        runInteractionIds.add(interactionId)
+        pendingInteractions.set(interactionId, {
+          respond(payload) {
+            const decision = String(payload?.decision || 'decline')
+            pendingInteractions.delete(interactionId)
+            runInteractionIds.delete(interactionId)
+            emitStep({
+              id: stepId,
+              kind: isCmd ? 'cmd' : 'file',
+              title,
+              status: decision === 'decline' || decision === 'cancel' ? 'error' : 'done',
+              detail: [target, reason, `已选择：${decision}`].filter(Boolean).join('\n'),
+              interaction: null
+            })
+            try { send({ id: e.id, result: { decision } }) } catch {}
+            return true
+          }
+        })
+        emitStep({
+          id: stepId,
+          kind: isCmd ? 'cmd' : 'file',
+          title,
+          status: 'waiting',
+          interaction: {
+            provider: 'Codex',
+            interactionId,
+            cascadeId: interactionId,
+            stepIndex: 0,
+            kind: 'permission',
+            title,
+            target: target || undefined,
+            reason: reason || undefined,
+            options: [
+              { id: 'accept', label: '允许本次', payload: { decision: 'accept' } },
+              { id: 'accept-session', label: '本会话始终允许', payload: { decision: 'acceptForSession' } },
+              { id: 'decline', label: '拒绝', danger: true, payload: { decision: 'decline' } }
+            ]
+          }
+        })
       }
       else send({id:e.id,error:{code:-32601,message:'Client capability unavailable'}})
       return
@@ -328,17 +708,69 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
         emitStep({id:u.toolCallId||u.title||'ag-tool',kind:'tool',title:u.title||'调用工具',status:st,detail:detail?detail.slice(-600):undefined})
       }
     }
+    const evThread=p.threadId||p.thread?.id||''
+    const isSubThread=Boolean(codex && codexThreadId && evThread && evThread!==codexThreadId)
+    if(e.method==='item/reasoning/summaryTextDelta'||e.method==='item/reasoning/textDelta'){
+      if(isSubThread)return
+      const rid=p.itemId||'codex-reason'
+      const prev=codexReasonBuf.get(rid)||''
+      const next=(prev+(p.delta||'')).slice(-2400)
+      codexReasonBuf.set(rid,next)
+      const now=Date.now()
+      if(now-lastThoughtEmit>350){
+        lastThoughtEmit=now
+        emitStep({id:'reason-'+rid,kind:'thought',title:'思考中',status:'running',detail:next.slice(-1800)})
+      }
+    }
     if(e.method==='item/agentMessage/delta'){
+      if(isSubThread)return
       if(currentItem!==p.itemId){if(output)append('\n\n');currentItem=p.itemId;deltas=''}
       deltas+=p.delta;append(p.delta)
     }
-    if(e.method==='item/started' && p.item?.type==='commandExecution')emitStep({id:p.item.id,kind:'cmd',title:p.item.command||'执行命令',status:'running'})
-    if(e.method==='item/completed'){
-      if(p.item?.type==='agentMessage' && (currentItem!==p.item.id || !deltas))append((output?'\n\n':'')+p.item.text)
-      if(p.item?.type==='commandExecution')emitStep({id:p.item.id,kind:'cmd',title:p.item.command||'执行命令',status:p.item.exitCode===0?'done':'error',detail:(p.item.aggregatedOutput||('退出码 '+p.item.exitCode)).slice(-800)})
-      if(p.item?.type==='fileChange')emitStep({id:p.item.id,kind:'file',title:'修改文件 · '+(p.item.changes?.length||0)+' 个',status:'done',detail:p.item.changes?.map(c=>c.path).join('\n')})
+    if(e.method==='item/started'){
+      const subPrefix=isSubThread?'[子代理] ':''
+      if(p.item?.type==='commandExecution')emitStep({id:p.item.id,kind:'cmd',title:subPrefix+(p.item.command||'执行命令'),status:'running'})
+      if(p.item?.type==='mcpToolCall'){
+        const title=subPrefix+summarizeToolTitle(p.item.tool||p.item.server||'MCP 工具',p.item.arguments)
+        const inStr=formatToolInput(p.item.arguments)
+        emitStep({id:p.item.id,kind:'tool',title,status:'running',detail:inStr?`输入：\n${inStr.slice(0,800)}`:undefined})
+      }
+      if(p.item?.type==='webSearch')emitStep({id:p.item.id,kind:'tool',title:subPrefix+'WebSearch'+(p.item.query?' · '+p.item.query.slice(0,60):''),status:'running'})
     }
-    if(e.method==='turn/completed')finish(p.turn?.status==='completed'?undefined:Error(p.turn?.error?.message||p.turn?.status||'执行失败'))
+    if(e.method==='item/completed'){
+      const subPrefix=isSubThread?'[子代理] ':''
+      if(p.item?.type==='agentMessage'){
+        if(isSubThread){
+          const txt=String(p.item.text||'').trim()
+          if(txt)emitStep({id:'submsg-'+(p.item.id||Date.now()),kind:'info',title:'[子代理] '+txt.replace(/\s+/g,' ').slice(0,64),status:'done',detail:txt.slice(0,2000)})
+        }else if(currentItem!==p.item.id || !deltas){
+          append((output?'\n\n':'')+p.item.text)
+        }
+      }
+      if(p.item?.type==='reasoning' && !isSubThread){
+        const rid=p.item.id||'codex-reason'
+        const summary=Array.isArray(p.item.summary)?p.item.summary.join('\n'):(p.item.text||codexReasonBuf.get(rid)||'')
+        codexReasonBuf.delete(rid)
+        if(summary.trim())emitStep({id:'reason-'+rid,kind:'thought',title:'思考过程',status:'done',detail:summary.trim().slice(-2000)})
+      }
+      if(p.item?.type==='commandExecution')emitStep({id:p.item.id,kind:'cmd',title:subPrefix+(p.item.command||'执行命令'),status:p.item.exitCode===0?'done':'error',detail:(p.item.aggregatedOutput||('退出码 '+p.item.exitCode)).slice(-1200)})
+      if(p.item?.type==='mcpToolCall'){
+        const title=subPrefix+summarizeToolTitle(p.item.tool||p.item.server||'MCP 工具',p.item.arguments)
+        const inStr=formatToolInput(p.item.arguments)
+        const outStr=extractToolResultText(p.item.result?.content??p.item.result??p.item.error).trim()
+        const parts=[]
+        if(inStr)parts.push('输入：\n'+inStr.slice(0,800))
+        if(outStr)parts.push('返回：\n'+outStr.slice(-1200))
+        emitStep({id:p.item.id,kind:'tool',title,status:p.item.error?'error':'done',detail:parts.length?parts.join('\n\n'):undefined})
+      }
+      if(p.item?.type==='webSearch')emitStep({id:p.item.id,kind:'tool',title:subPrefix+'WebSearch'+(p.item.query?' · '+p.item.query.slice(0,60):''),status:'done'})
+      if(p.item?.type==='fileChange')emitStep({id:p.item.id,kind:'file',title:subPrefix+'修改文件 · '+(p.item.changes?.length||0)+' 个',status:'done',detail:p.item.changes?.map(c=>c.path).join('\n')})
+    }
+    if(e.method==='turn/completed'){
+      if(isSubThread)return
+      if(codexTurnId && p.turn?.id && p.turn.id!==codexTurnId)return
+      finish(p.turn?.status==='completed'?undefined:Error(p.turn?.error?.message||p.turn?.status||'执行失败'))
+    }
   })
   try {
     if(simpleCli){
@@ -354,7 +786,7 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
     }
     if(claude || workbuddy){
       if(effort && claude)emit('log','请求思考强度 · '+effort)
-      const fullPrompt=images.length?prompt+'\n\n[用户附带了以下图片文件，请使用 Read 工具查看：\n'+images.map(i=>i.path).join('\n')+'\n]':prompt
+      const fullPrompt=images.length?prompt+'\n\n[用户附带了以下文件，请使用 Read 工具查看：\n'+images.map(i=>i.path).join('\n')+'\n]':prompt
       child.stdin.end(fullPrompt);await done
       return
     }
@@ -367,16 +799,21 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
       const defaultModel=model||catalog.data.find(m=>m.isDefault)?.model
       if(effort&&!catalog.data.find(m=>m.model===defaultModel)?.supportedReasoningEfforts.some(e=>e.reasoningEffort===effort))throw Error('当前模型不支持此强度')
       const turnEffort=effort||catalog.data.find(m=>m.model===defaultModel)?.defaultReasoningEffort
-      const opts={cwd,...(defaultModel?{model:defaultModel}:{}),sandbox:write?'workspace-write':'read-only',approvalPolicy:'never'}
+      const codexSandbox=accessMode==='full'?'danger-full-access':(accessMode==='workspace'?'workspace-write':'read-only')
+      const opts={cwd,...(defaultModel?{model:defaultModel}:{}),sandbox:codexSandbox,approvalPolicy:'never'}
       const resumeCodex=async params=>{
         for(let attempt=0;;attempt++){
           try{ return await request('thread/resume',params) }
           catch(e){
             if(!/already has an active writer/i.test(e.message))throw e
-            if(attempt>=2)throw Error('该 Codex 会话正被其他 Codex 客户端或进程占用，请在 Codex 客户端切走该对话（等待约 1 分钟）或退出客户端后重试')
-            signal.throwIfAborted()
-            await new Promise(r=>setTimeout(r,attempt===0?500:1000))
-            signal.throwIfAborted()
+            if(attempt<1){
+              signal.throwIfAborted()
+              await new Promise(r=>setTimeout(r,500))
+              signal.throwIfAborted()
+              continue
+            }
+            emit('log','原 Codex 会话正被其他客户端占用，已自动分叉保留完整上下文继续。')
+            return await request('thread/fork',params)
           }
         }
       }
@@ -392,10 +829,18 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
       if(result.model)emit('log','模型 · '+result.model)
       const id=result.thread.id;codexThreadId=id;emit('session',id);active=true
       if(title && result.thread.name !== title) await request('thread/name/set',{threadId:id,name:title}).catch(()=>emit('log','Codex 未能更新会话标题，原生会话已保存。'))
-      const sandboxPolicy=write?{type:'workspaceWrite',writableRoots:[cwd],networkAccess:false,excludeTmpdirEnvVar:true,excludeSlashTmp:true}:{type:'readOnly',networkAccess:false}
+      const sandboxPolicy=accessMode==='full'
+        ? {type:'dangerFullAccess'}
+        : (accessMode==='workspace'
+            ? {type:'workspaceWrite',writableRoots:[cwd],networkAccess:true,excludeTmpdirEnvVar:false,excludeSlashTmp:false}
+            : {type:'readOnly',networkAccess:false})
       if(effort)emit('log','请求思考强度 · '+effort)
-      const codexInput=[{type:'text',text:prompt,text_elements:[]},...images.map(i=>({type:'localImage',path:i.path}))]
-      await request('turn/start',{threadId:id,cwd,...(turnEffort?{effort:turnEffort}:{}),...(defaultModel?{model:defaultModel}:{}),approvalPolicy:'never',sandboxPolicy,input:codexInput})
+      const codexImages=images.filter(i=>i.isImage!==false && String(i.mimeType||'').startsWith('image/'))
+      const codexFiles=images.filter(i=>!codexImages.includes(i))
+      const codexText=codexFiles.length?prompt+'\n\n[用户附带了以下文件，请按需读取：\n'+codexFiles.map(f=>`${f.name}: ${f.path}`).join('\n')+'\n]':prompt
+      const codexInput=[{type:'text',text:codexText,text_elements:[]},...codexImages.map(i=>({type:'localImage',path:i.path}))]
+      const turnRes=await request('turn/start',{threadId:id,cwd,...(turnEffort?{effort:turnEffort}:{}),...(defaultModel?{model:defaultModel}:{}),approvalPolicy:'never',sandboxPolicy,input:codexInput})
+      codexTurnId=turnRes?.turn?.id||turnRes?.turnId||''
       await done
     }else{
       await request('initialize',{protocolVersion:1,clientCapabilities:{},clientInfo:{name:'OminiHive',version:'0.1'}})
@@ -416,12 +861,18 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
       await request('session/set_mode',{sessionId:id,modeId:write?'auto':'plan'}).catch(()=>request('session/set_mode',{sessionId:id,modeId:'plan'}).catch(()=>{}))
       if(session)await new Promise(r=>setTimeout(r,150))
       emit('session',id);active=true
-      const agPrompt=[{type:'text',text:prompt},...images.map(i=>({type:'image',data:i.base64,mimeType:i.mimeType}))]
+      const agImages=images.filter(i=>i.isImage!==false && String(i.mimeType||'').startsWith('image/'))
+      const agFiles=images.filter(i=>!agImages.includes(i))
+      const agText=agFiles.length?prompt+'\n\n[用户附带了以下文件，请按需读取：\n'+agFiles.map(f=>`${f.name}: ${f.path}`).join('\n')+'\n]':prompt
+      const agPrompt=[{type:'text',text:agText},...agImages.map(i=>({type:'image',data:i.base64,mimeType:i.mimeType}))]
       const turn=await request('session/prompt',{sessionId:id,prompt:agPrompt})
       if(turn.stopReason!=='end_turn')throw Error(turn.stopReason||'执行中断')
       if(!output.trim())throw Error('Antigravity 未返回正文（可能因工具权限被规划模式取消）')
     }
   }finally{
+    for (const id of runInteractionIds) pendingInteractions.delete(id)
+    runInteractionIds.clear()
+    stepAdapter?.finalize()
     signal.removeEventListener('abort',aborted)
     if(codex){
       const wait=(p,ms)=>new Promise(resolve=>{

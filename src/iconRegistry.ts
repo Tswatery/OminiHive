@@ -20,6 +20,7 @@ export type VendorIconKey =
   | 'openclaw'
   | 'opencode'
   | 'workbuddy'
+  | 'xiaomi'
 
 export const VENDOR_ICON_SRC: Record<VendorIconKey, string> = {
   openai: './icons/openai.svg',
@@ -28,7 +29,7 @@ export const VENDOR_ICON_SRC: Record<VendorIconKey, string> = {
   deepseek: './icons/deepseek-color.svg',
   kimi: './icons/kimi-color.svg',
   doubao: './icons/doubao-color.svg',
-  zhipu: './icons/zhipu-color.svg',
+  zhipu: './icons/zai.svg',
   qwen: './icons/qwen-color.svg',
   minimax: './icons/minimax-color.svg',
   grok: './icons/grok.svg',
@@ -42,7 +43,8 @@ export const VENDOR_ICON_SRC: Record<VendorIconKey, string> = {
   perplexity: './icons/perplexity-color.svg',
   openclaw: './icons/openclaw-color.svg',
   opencode: './icons/opencode.svg',
-  workbuddy: './icons/workbuddy.png'
+  workbuddy: './icons/workbuddy.png',
+  xiaomi: './icons/xiaomi-color.svg'
 }
 
 /**
@@ -55,26 +57,36 @@ const MODEL_VENDOR_RULES: Array<{ vendor: VendorIconKey; pattern: RegExp }> = [
   { vendor: 'gemini', pattern: /(?:gemini|gemma|google|orchestrator|neon|argon|hydrogen)/i },
   { vendor: 'deepseek', pattern: /(?:deepseek|dsh)/i },
   { vendor: 'kimi', pattern: /(?:kimi|moonshot)/i },
+  { vendor: 'zhipu', pattern: /(?:glm|chatglm|zhipu|codegeex|z\.ai)/i },
   { vendor: 'doubao', pattern: /(?:doubao|seed[-_.]?\d|bytedance|volc|ep-\d)/i },
-  { vendor: 'zhipu', pattern: /(?:glm|chatglm|zhipu|codegeex)/i },
   { vendor: 'qwen', pattern: /(?:qwen|qwq|tongyi)/i },
   { vendor: 'minimax', pattern: /(?:minimax|abab)/i },
   { vendor: 'grok', pattern: /(?:grok|xai)/i },
-  { vendor: 'hunyuan', pattern: /(?:hunyuan|tencent)/i },
+  { vendor: 'hunyuan', pattern: /(?:hunyuan|tencent|(?:^|[^a-z])hy\d)/i },
+  { vendor: 'workbuddy', pattern: /(?:workbuddy|codebuddy|space[-_.]?bunny|fast-model|balanced-model|deep-model)/i },
   { vendor: 'meta', pattern: /(?:llama|meta[-_/])/i },
   { vendor: 'mistral', pattern: /(?:mistral|mixtral|codestral|devstral|pixtral)/i },
   { vendor: 'stepfun', pattern: /(?:step[-_.]?\d|stepfun)/i },
   { vendor: 'yi', pattern: /(?:^|[^a-z])yi[-_.]?(?:\d|lightning|large|medium|vision|coder)/i },
   { vendor: 'baichuan', pattern: /baichuan/i },
   { vendor: 'cohere', pattern: /(?:cohere|command[-_.]?(?:r|a))/i },
-  { vendor: 'perplexity', pattern: /(?:perplexity|sonar)/i }
+  { vendor: 'perplexity', pattern: /(?:perplexity|sonar)/i },
+  { vendor: 'xiaomi', pattern: /(?:xiaomi|mimo)/i }
 ]
 
 export function resolveModelVendor(model?: string, label?: string): VendorIconKey | null {
-  const text = `${model || ''} ${label || ''}`.trim()
-  if (!text) return null
-  for (const rule of MODEL_VENDOR_RULES) {
-    if (rule.pattern.test(text)) return rule.vendor
+  const bareModel = model?.includes('/') ? model.split('/').slice(1).join('/') : (model || '')
+  const primary = `${bareModel} ${label || ''}`.trim()
+  if (primary) {
+    for (const rule of MODEL_VENDOR_RULES) {
+      if (rule.pattern.test(primary)) return rule.vendor
+    }
+  }
+  const fallback = (model || '').trim()
+  if (fallback && fallback !== bareModel) {
+    for (const rule of MODEL_VENDOR_RULES) {
+      if (rule.pattern.test(fallback)) return rule.vendor
+    }
   }
   return null
 }

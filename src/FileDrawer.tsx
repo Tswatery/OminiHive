@@ -5,6 +5,8 @@ import {
   Folder, FolderOpen, MessageSquarePlus, RefreshCw, X
 } from 'lucide-react'
 import { MarkdownView } from './MarkdownView'
+import { ScrollArea } from './OverlayScrollbar'
+import { cleanError } from './errors'
 
 export type FileEntry = {
   name: string
@@ -87,7 +89,7 @@ export function FileDrawer({
       const res = await window.hive.previewFile(roomId, entry.path)
       setPreview(res)
     } catch (e) {
-      setPreviewErr(String(e).replace(/^.*Error:\s*/, ''))
+      setPreviewErr(cleanError(e))
     }
   }
 
@@ -153,12 +155,12 @@ export function FileDrawer({
 
       {previewErr && <div className="file-err">{previewErr}</div>}
 
-      <div className="file-tree">
+      <ScrollArea className="file-tree" insetTop={4} insetBottom={4}>
         {renderNodes('', 0)}
         {!loading && !(childrenMap['']?.length) && (
           <div className="file-empty">目录为空</div>
         )}
-      </div>
+      </ScrollArea>
 
       <Dialog.Root open={Boolean(preview)} onOpenChange={open => { if (!open) setPreview(null) }}>
         <Dialog.Content className="preview-dialog" maxWidth="88vw">
@@ -184,7 +186,7 @@ export function FileDrawer({
                 </div>
               </div>
 
-              <div className="preview-body">
+              <ScrollArea className="preview-body" insetTop={6} insetBottom={6}>
                 {preview.kind === 'image' && (
                   <div className="preview-img-wrap">
                     <img src={preview.dataUrl} alt={preview.name} />
@@ -206,7 +208,7 @@ export function FileDrawer({
                     <p>{preview.note || '此文件格式暂不支持内置预览，可点击右上角用系统应用打开。'}</p>
                   </div>
                 )}
-              </div>
+              </ScrollArea>
             </>
           )}
         </Dialog.Content>

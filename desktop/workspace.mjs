@@ -2,7 +2,7 @@ import { existsSync, readdirSync, readFileSync, statSync, realpathSync } from 'n
 import { homedir } from 'node:os'
 import path from 'node:path'
 
-const IGNORE_NAMES = new Set(['node_modules', '.git', '.DS_Store', 'dist', '.next', '__pycache__', '.turbo', '.cache'])
+const IGNORE_NAMES = new Set(['node_modules', '.git', '.DS_Store', '.ominihive', 'dist', '.next', '__pycache__', '.turbo', '.cache'])
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg', '.bmp', '.ico'])
 const TEXT_EXTS = new Set([
   '.md', '.mdx', '.txt', '.json', '.jsonl', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
@@ -90,10 +90,26 @@ function parseSkillMeta(skillMdPath, fallbackName) {
     const raw = readFileSync(skillMdPath, 'utf8').slice(0, 4096)
     const fm = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1] || ''
     const nameMatch = fm.match(/^name:\s*['"]?(.+?)['"]?\s*$/m)
-    const descMatch = fm.match(/^description:\s*['"]?(.+?)['"]?\s*$/m)
+    let description = ''
+    const descMatch = fm.match(/^description:\s*(.*)$/m)
+    if (descMatch) {
+      const first = descMatch[1].trim()
+      if (/^[>|][+-]?$/.test(first)) {
+        const rest = fm.slice((descMatch.index ?? 0) + descMatch[0].length)
+        const lines = []
+        for (const line of rest.split(/\r?\n/).slice(1)) {
+          if (!line.trim()) { if (lines.length) break; continue }
+          if (!/^[ \t]+/.test(line)) break
+          lines.push(line.trim())
+        }
+        description = lines.join(' ').trim()
+      } else {
+        description = first.replace(/^['"]|['"]$/g, '').trim()
+      }
+    }
     return {
       name: (nameMatch?.[1] || fallbackName).trim(),
-      description: (descMatch?.[1] || '').trim()
+      description
     }
   } catch {
     return { name: fallbackName, description: '' }

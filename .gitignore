@@ -8,3 +8,5 @@ release/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+.spec-workflow/
+dev/

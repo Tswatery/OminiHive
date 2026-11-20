@@ -1,9 +1,11 @@
 const { contextBridge, ipcRenderer } = require('electron')
 const api = {}
 for (const key of [
-  'tree', 'messages', 'add', 'room', 'renameRoom', 'send', 'stop', 'remove',
+  'tree', 'messages', 'syncRoom', 'add', 'room', 'renameProject', 'renameRoom', 'externalSessions', 'importSession',
+  'send', 'stop', 'remove',
   'cachedModels', 'models', 'clients', 'ccSwitch', 'updates', 'upgrade', 'openExternal', 'openPath',
-  'volcQuota', 'volcLogin', 'files', 'previewFile', 'agentSkills'
+  'volcQuota', 'volcLogin', 'files', 'previewFile', 'agentSkills',
+  'respondInteraction', 'focusAntigravity', 'setTheme'
 ]) {
   api[key] = (...args) => ipcRenderer.invoke(key, ...args)
 }

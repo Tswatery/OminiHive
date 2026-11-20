@@ -6,6 +6,8 @@ import { VolcQuota } from './VolcQuota'
 import { ModelIcon } from './ModelIcon'
 import { AgentIcon } from './AgentIcon'
 import { agentLabel } from './agentMeta'
+import { ScrollArea } from './OverlayScrollbar'
+import { cleanError } from './errors'
 
 export type ModelOption = Option & { efforts: string[]; defaultEffort?: string; isDefault?: boolean }
 export type ClientInfo = {
@@ -184,7 +186,7 @@ export function ModelEffortPicker({
             <span>{agent} 模型</span>
             {hint && <span className="panel-hint">{hint}</span>}
           </div>
-          <div className="model-list">
+          <ScrollArea className="model-list" variant="input" insetTop={4} insetBottom={4}>
             <button
               type="button"
               className={'model-item ' + (!model ? 'selected' : '')}
@@ -207,7 +209,7 @@ export function ModelEffortPicker({
                 {model === m.id && <Check size={14} />}
               </button>
             ))}
-          </div>
+          </ScrollArea>
         </div>
 
         <div className="panel-section panel-effort">
@@ -285,13 +287,13 @@ export function Settings({
   async function refresh(remote: boolean) {
     setBusy(true); setError('')
     try { setRows(await (remote ? window.hive.updates() : window.hive.clients())) }
-    catch (e) { setError(String(e)) }
+    catch (e) { setError(cleanError(e)) }
     finally { setBusy(false) }
   }
 
   async function install(row: ClientInfo) {
     try { await window.hive.upgrade(row.agent) }
-    catch (e) { setRowError(row.agent, String(e).replace(/^.*Error:\s*/, '')) }
+    catch (e) { setRowError(row.agent, cleanError(e)) }
   }
 
   return (

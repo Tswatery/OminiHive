@@ -24,7 +24,7 @@ function highlightCode(code: string): React.ReactNode[] {
   return out
 }
 
-function CodeBlock({ lang, code }: { lang: string; code: string }) {
+const CodeBlock = React.memo(function CodeBlock({ lang, code }: { lang: string; code: string }) {
   const [copied, setCopied] = useState(false)
   function copy() {
     void navigator.clipboard.writeText(code)
@@ -42,7 +42,7 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
       <pre><code>{highlightCode(code)}</code></pre>
     </div>
   )
-}
+})
 
 function looksLikePath(s: string) {
   if (!s || s.length > 180 || /\s/.test(s)) return false
@@ -50,22 +50,46 @@ function looksLikePath(s: string) {
 }
 
 function preprocessCitations(md: string): string {
-  return md.replace(/:codex-file-citation\{([^}]+)\}/g, (_full, attrs) => {
+  let out = md.replace(/:codex-file-citation\{([^}]+)\}/g, (_full, attrs) => {
     const pathMatch = attrs.match(/path="([^"]+)"/) || attrs.match(/path='([^']+)'/)
     if (!pathMatch) return ''
     const filePath = pathMatch[1]
     const name = filePath.split(/[/\\]/).pop() || filePath
     return `[${name}](omini-cite://${encodeURIComponent(filePath)})`
   })
+  out = out.replace(/<oai-mem-citation>([\s\S]*?)<\/oai-mem-citation>/gi, (_full, inner) => {
+    const entriesMatch = inner.match(/<citation_entries>([\s\S]*?)<\/citation_entries>/i)
+    const rawEntries = (entriesMatch?.[1] || '').trim()
+    if (!rawEntries) return ''
+    const chips: string[] = []
+    const entryRe = /([^\s|:<>]+)(?::(\d+(?:-\d+)?))?(?:\|note=\[([^\]]*)\])?/g
+    for (const m of rawEntries.matchAll(entryRe)) {
+      const filePath = m[1]
+      if (!filePath || filePath.startsWith('<')) continue
+      const range = m[2] || ''
+      const note = (m[3] || '').trim()
+      let lineLabel = ''
+      if (range) {
+        const [s, e] = range.split('-')
+        lineLabel = ':' + (e && s === e ? s : range)
+      }
+      const name = (filePath.split(/[/\\]/).pop() || filePath) + lineLabel
+      const label = note ? `${name} · ${note}` : name
+      const payload = JSON.stringify({ path: filePath, note })
+      chips.push(`[${label.replace(/[\[\]]/g, '')}](omini-mem://${encodeURIComponent(payload)})`)
+    }
+    return chips.length ? '\n\n' + chips.join(' ') : ''
+  })
+  return out
 }
 
-export function MarkdownView({ content, roomId }: { content: string; roomId?: string }) {
+export const MarkdownView = React.memo(function MarkdownView({ content, roomId }: { content: string; roomId?: string }) {
   const processed = preprocessCitations(content)
   return (
     <div className="markdown">
       <Markdown
         remarkPlugins={[gfm]}
-        urlTransform={url => url.startsWith('omini-cite://') ? url : defaultUrlTransform(url)}
+        urlTransform={url => (url.startsWith('omini-cite://') || url.startsWith('omini-mem://')) ? url : defaultUrlTransform(url)}
         components={{
           img: ({ src, alt }) => src ? <span className="md-img-alt">[图片: {alt || src}]</span> : null,
           a: ({ href, children }) => {
@@ -77,6 +101,26 @@ export function MarkdownView({ content, roomId }: { content: string; roomId?: st
                   className="cite-chip"
                   title={targetPath + ' · 点击在 Finder 中定位'}
                   onClick={() => void window.hive.openPath(targetPath, roomId)}
+                >
+                  <FileText size={12} />
+                  <span>{children}</span>
+                </button>
+              )
+            }
+            if (href?.startsWith('omini-mem://')) {
+              let targetPath = ''
+              let note = ''
+              try {
+                const parsed = JSON.parse(decodeURIComponent(href.slice('omini-mem://'.length)))
+                targetPath = parsed.path || ''
+                note = parsed.note || ''
+              } catch {}
+              return (
+                <button
+                  type="button"
+                  className="cite-chip"
+                  title={[targetPath, note].filter(Boolean).join(' · ')}
+                  onClick={() => { if (targetPath) void window.hive.openPath(targetPath, roomId) }}
                 >
                   <FileText size={12} />
                   <span>{children}</span>
@@ -128,4 +172,4 @@ export function MarkdownView({ content, roomId }: { content: string; roomId?: st
       </Markdown>
     </div>
   )
-}
+})

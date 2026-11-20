@@ -3,6 +3,7 @@ import { Popover } from '@radix-ui/themes'
 import { Check, ChevronDown, Search, UserPlus, Users } from 'lucide-react'
 import { AgentIcon } from './AgentIcon'
 import { ALL_AGENTS, CORE_AGENTS, agentLabel, agentShort, agentMatchesQuery, type Agent } from './agentMeta'
+import { ScrollArea } from './OverlayScrollbar'
 
 export function RoomMembersPicker({
   open,
@@ -93,7 +94,7 @@ export function RoomMembersPicker({
           />
         </div>
 
-        <div className="members-list">
+        <ScrollArea className="members-list" variant="input" insetTop={4} insetBottom={4}>
           {installedList.length > 0 && (
             <div className="members-group">
               <div className="members-group-title">可拉入 · {installedList.length}</div>
@@ -141,7 +142,7 @@ export function RoomMembersPicker({
           {!installedList.length && !uninstalledList.length && (
             <div className="members-empty">未找到匹配的 Agent</div>
           )}
-        </div>
+        </ScrollArea>
       </Popover.Content>
     </Popover.Root>
   )
@@ -198,7 +199,7 @@ export function TargetSelector({
           </span>
           <span className="target-capsule-label">{label}</span>
           {anyBusy && <span className="pulse-dot mini" />}
-          <ChevronDown size={12} className="tool-chip-caret" />
+          <ChevronDown size={12} className={'tool-chip-caret' + (open ? ' open' : '')} />
         </button>
       </Popover.Trigger>
       <Popover.Content side="top" align="start" sideOffset={8} width="268px" className="target-popover">
@@ -243,7 +244,7 @@ export function TargetSelector({
                   type="button"
                   className="target-main-btn"
                   onMouseEnter={() => { if (selected) onInspect(a) }}
-                  onClick={() => { onSelectSingle(a); setOpen(false) }}
+                  onClick={() => { onSelectSingle(a) }}
                 >
                   <AgentIcon name={a} size={16} />
                   <span className="target-row-name">{agentLabel(a)}</span>

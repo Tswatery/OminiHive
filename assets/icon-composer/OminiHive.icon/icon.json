@@ -1,0 +1,34 @@
+{
+  "fill" : {
+    "automatic-gradient" : "srgb:0.89020,0.65490,0.18431,1.00000"
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "glass" : false,
+          "image-name" : "hive-friends.png",
+          "name" : "hive-friends",
+          "position" : {
+            "scale" : 0.86,
+            "translation-in-points" : [
+              0,
+              0
+            ]
+          }
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.4
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "squares" : "shared"
+  }
+}

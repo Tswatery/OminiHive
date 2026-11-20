@@ -3,6 +3,7 @@ import {homedir} from 'node:os'
 import path from 'node:path'
 import {binary,names} from './clients.mjs'
 import {modelList} from './agents.mjs'
+import {normalizeModelEfforts} from './reasoning.mjs'
 
 const reference=JSON.parse(readFileSync(new URL('./antigravity-catalog.json',import.meta.url),'utf8')).models
 
@@ -13,17 +14,21 @@ function stamp(file){
 function fingerprint(agent){
   const exe=binary(agent)
   if(!Object.hasOwn(names,agent)||!exe)throw Error('未找到本机客户端')
-  const config=agent==='Claude'?path.join(homedir(),'.claude/settings.json'):
-    agent==='Codex'?path.join(process.env.CODEX_HOME||path.join(homedir(),'.codex'),'config.toml'):null
-  return JSON.stringify([stamp(exe),config&&stamp(config)])
+  const configs=agent==='Claude'?[path.join(homedir(),'.claude/settings.json')]:
+    agent==='Codex'?[path.join(process.env.CODEX_HOME||path.join(homedir(),'.codex'),'config.toml')]:
+    agent==='OhMyPi'?[path.join(homedir(),'.omp/agent/config.yml'),path.join(homedir(),'.omp/agent/models.yml')]:
+    agent==='DeepSeek'?[path.join(homedir(),'.dsh/profiles/headless/cordis.patch.yml'),path.join(homedir(),'.dsh/profiles/web/cordis.patch.yml')]:[]
+  return JSON.stringify([stamp(exe),...configs.map(stamp)])
 }
 
 export function createCatalog(dir,load=modelList){
   const entries=new Map(),pending=new Map()
-  const file=path.join(dir,'model-lists-v1.json')
+  const file=path.join(dir,'model-lists-v2.json')
   try{
     for(const [agent,e] of Object.entries(JSON.parse(readFileSync(file,'utf8')))){
-      if(Object.hasOwn(names,agent)&&e?.list?.length&&Array.isArray(e.list)&&e.list.every(m=>typeof m?.id==='string'&&Array.isArray(m.efforts)))entries.set(agent,e)
+      if(Object.hasOwn(names,agent)&&e?.list?.length&&Array.isArray(e.list)&&e.list.every(m=>typeof m?.id==='string'&&Array.isArray(m.efforts))){
+        entries.set(agent,{...e,list:normalizeModelEfforts(agent,e.list)})
+      }
     }
   }catch{}
   function peek(agent){
