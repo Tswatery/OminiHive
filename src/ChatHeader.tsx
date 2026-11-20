@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React from 'react'
 import { ChevronRight, Download, FolderTree, PanelLeft, RefreshCw, SquarePen } from 'lucide-react'
 
 export type ChatHeaderProps = {
@@ -8,8 +8,6 @@ export type ChatHeaderProps = {
   onNewRoom: () => void
   project: { id: string; name: string; dir: string } | null
   currentRoom: { id: string; project: string; title: string } | null
-  /** Called with the edited title; the header owns its own editing state. */
-  onRename: (roomId: string, title: string) => void
   onOpenProjectDir: (dir: string) => void
   /** Slot for the room-members picker (kept outside so the header doesn't forward its props). */
   members?: React.ReactNode
@@ -26,7 +24,6 @@ export function ChatHeader({
   onNewRoom,
   project,
   currentRoom,
-  onRename,
   onOpenProjectDir,
   members,
   syncing,
@@ -35,33 +32,6 @@ export function ChatHeader({
   onToggleFiles,
   onOpenImport
 }: ChatHeaderProps) {
-  const [editing, setEditing] = useState(false)
-  const [draft, setDraft] = useState('')
-  // Escape unmounts the input, which may still fire blur; don't let that commit the draft.
-  const cancelled = useRef(false)
-
-  // leaving the room abandons an in-progress rename
-  useEffect(() => { setEditing(false) }, [currentRoom?.id])
-
-  function startEdit() {
-    if (!currentRoom) return
-    cancelled.current = false
-    setDraft(currentRoom.title)
-    setEditing(true)
-  }
-
-  function commit() {
-    if (!editing || cancelled.current || !currentRoom) return
-    setEditing(false)
-    const title = draft.trim()
-    if (title && title !== currentRoom.title) onRename(currentRoom.id, title)
-  }
-
-  function cancel() {
-    cancelled.current = true
-    setEditing(false)
-  }
-
   return (
     <header className={'chathead ' + (collapsed ? 'with-traffic-lights' : '')}>
       {collapsed && (
@@ -84,24 +54,7 @@ export function ChatHeader({
             </span>
             <ChevronRight size={13} className="head-sep" />
             {currentRoom && (
-              editing ? (
-                <input
-                  className="rename-input"
-                  style={{ maxWidth: 320, minWidth: 160 }}
-                  autoFocus
-                  value={draft}
-                  onChange={e => setDraft(e.target.value)}
-                  onBlur={commit}
-                  onKeyDown={e => {
-                    if (e.key === 'Enter' && !e.nativeEvent.isComposing) commit()
-                    if (e.key === 'Escape') cancel()
-                  }}
-                />
-              ) : (
-                <strong title="双击重命名讨论" onDoubleClick={startEdit}>
-                  {currentRoom.title}
-                </strong>
-              )
+              <strong>{currentRoom.title}</strong>
             )}
           </>
         ) : (

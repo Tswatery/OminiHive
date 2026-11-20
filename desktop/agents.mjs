@@ -1,8 +1,8 @@
 import {randomUUID} from 'node:crypto'
 import { promisify } from 'node:util'
 import { spawn,execFile } from 'node:child_process'
-import { existsSync, readFileSync, readdirSync, statSync, accessSync, constants } from 'node:fs'
-import { homedir } from 'node:os'
+import { existsSync, readFileSync, readdirSync, statSync, accessSync, constants, writeFileSync, unlinkSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 import { createInterface } from 'node:readline'
 
@@ -12,9 +12,72 @@ import {antigravityEnv} from './antigravity-env.mjs'
 import {resolveProviderConfig,prepareCodexHome,legacyCodexRollout} from './ccswitch.mjs'
 import {EFFORT_LEVELS,isValidEffort,normalizeModelEfforts,applyReasoningEffort} from './reasoning.mjs'
 import {createStepAdapter} from './step-tracker.mjs'
+
+// Every agent CLI runs in its own process group (detached). Track them so app quit can
+// terminate the whole group synchronously instead of leaving orphaned CLIs behind.
+const liveChildren=new Set()
+export function killAllAgentProcesses(signal='SIGTERM'){
+  for(const child of liveChildren){try{process.kill(-child.pid,signal)}catch{}}
+}
 export {availability} from './clients.mjs'
 const ordered=EFFORT_LEVELS
 const pendingInteractions=new Map()
+
+export function buildDeepSeekArgs({ prompt, accessMode, write, session, patchFile } = {}) {
+  const args = ['headless']
+  if (patchFile) args.push('--patch', patchFile)
+  args.push('--json')
+  if (accessMode === 'full') {
+    args.push('--permission-mode', 'danger-full-access')
+  } else if (write) {
+    args.push('--permission-mode', 'workspace-write', '--approval-policy', 'never')
+  } else {
+    args.push('--permission-mode', 'read-only', '--approval-policy', 'never')
+  }
+  if (session) args.push('--session-id', session)
+  args.push('--', prompt)
+  return args
+}
+
+function createDeepSeekModelPatch(model) {
+  if (!model) return null
+  try {
+    const p = path.join(homedir(), '.dsh', 'profiles', 'headless', 'cordis.patch.yml')
+    if (!existsSync(p)) return null
+    const raw = readFileSync(p, 'utf8')
+    const defBlock = raw.match(/-\s*id:\s*agent-default-model[\s\S]*?(?=\n-\s*id:|\s*$)/)?.[0] || ''
+    const defaultModel = defBlock.match(/^\s*model:\s*['"]?([^\s'"#]+)['"]?/m)?.[1] || ''
+    const defaultProvider = defBlock.match(/^\s*provider:\s*['"]?([^\s'"#]+)['"]?/m)?.[1] || ''
+    if (defaultModel && model === defaultModel) return null
+
+    let targetProvider = ''
+    const llmBlock = raw.match(/-\s*id:\s*llm-pi-ai[\s\S]*?(?=\n-\s*id:|\s*$)/)?.[0] || ''
+    if (llmBlock) {
+      let currentProvider = ''
+      for (const line of llmBlock.split(/\r?\n/)) {
+        const provMatch = line.match(/^[ \t]{4,6}([\w.-]+):\s*$/)
+        if (provMatch && provMatch[1] !== 'providers' && provMatch[1] !== 'models' && provMatch[1] !== 'input') {
+          currentProvider = provMatch[1]
+          continue
+        }
+        const idMatch = line.match(/^[ \t]+-\s*id:\s*['"]?([^\s'"#]+)['"]?/)
+        if (idMatch && idMatch[1].trim() === model && currentProvider) {
+          targetProvider = currentProvider
+          break
+        }
+      }
+    }
+    if (!targetProvider) targetProvider = defaultProvider
+    if (!targetProvider) return null
+
+    const patchPath = path.join(tmpdir(), `ominihive-dsh-patch-${randomUUID()}.yml`)
+    const content = `- id: agent-default-model\n  config:\n    provider: ${JSON.stringify(targetProvider)}\n    model: ${JSON.stringify(model)}\n`
+    writeFileSync(patchPath, content, { encoding: 'utf8', mode: 0o600 })
+    return patchPath
+  } catch {
+    return null
+  }
+}
 
 export function respondAgentInteraction(req){
   const key=req?.interactionId||req?.cascadeId||''
@@ -299,9 +362,10 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
     args=['-p',imgPrompt]
     if(model)args.push('--model',model)
   }
+  let deepseekPatchFile=null
   if(deepseek){
-    args=['run',imgPrompt]
-    if(model)args.push('--model',model)
+    deepseekPatchFile=createDeepSeekModelPatch(model)
+    args=buildDeepSeekArgs({prompt:imgPrompt,accessMode,write,session,patchFile:deepseekPatchFile})
   }
   if(claude) {
     args=['-p','--verbose','--output-format','stream-json','--include-partial-messages','--permission-mode',accessMode==='full'?'bypassPermissions':(write?'acceptEdits':'dontAsk')]
@@ -329,6 +393,8 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
   const spawnArgs = isMjsExe ? [exe, ...args] : args
   if (isMjsExe) env.ELECTRON_RUN_AS_NODE = '1'
   const child=spawn(spawnCmd,spawnArgs,{cwd,env:agent==='Antigravity'?await antigravityEnv(env):env,stdio:'pipe',detached:true})
+  liveChildren.add(child)
+  child.once('close',()=>liveChildren.delete(child))
   const lines=createInterface({input:child.stdout})
   const pending=new Map()
   const runInteractionIds=new Set()
@@ -736,6 +802,14 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
         emitStep({id:p.item.id,kind:'tool',title,status:'running',detail:inStr?`输入：\n${inStr.slice(0,800)}`:undefined})
       }
       if(p.item?.type==='webSearch')emitStep({id:p.item.id,kind:'tool',title:subPrefix+'WebSearch'+(p.item.query?' · '+p.item.query.slice(0,60):''),status:'running'})
+      if(p.item?.type==='imageView'){
+        const imgPath=String(p.item.path||p.item.imagePath||p.item.filePath||'').trim()
+        const name=imgPath?path.basename(imgPath):'图像'
+        emitStep({id:p.item.id||('img-'+Date.now()),kind:'file',title:subPrefix+'查看图像 · '+name,status:'running',detail:imgPath||undefined,imagePath:imgPath||undefined})
+      }
+      if(p.item?.type==='imageGeneration'){
+        emitStep({id:p.item.id||('imggen-'+Date.now()),kind:'tool',title:subPrefix+'生成图像',status:'running'})
+      }
     }
     if(e.method==='item/completed'){
       const subPrefix=isSubThread?'[子代理] ':''
@@ -765,6 +839,16 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
       }
       if(p.item?.type==='webSearch')emitStep({id:p.item.id,kind:'tool',title:subPrefix+'WebSearch'+(p.item.query?' · '+p.item.query.slice(0,60):''),status:'done'})
       if(p.item?.type==='fileChange')emitStep({id:p.item.id,kind:'file',title:subPrefix+'修改文件 · '+(p.item.changes?.length||0)+' 个',status:'done',detail:p.item.changes?.map(c=>c.path).join('\n')})
+      if(p.item?.type==='imageView'){
+        const imgPath=String(p.item.path||p.item.imagePath||p.item.filePath||'').trim()
+        const name=imgPath?path.basename(imgPath):'图像'
+        emitStep({id:p.item.id||('img-'+Date.now()),kind:'file',title:subPrefix+'查看图像 · '+name,status:'done',detail:imgPath||undefined,imagePath:imgPath||undefined})
+      }
+      if(p.item?.type==='imageGeneration'){
+        const imgPath=String(p.item.savedPath||p.item.path||p.item.outputPath||p.item.imagePath||'').trim()
+        const name=imgPath?path.basename(imgPath):''
+        emitStep({id:p.item.id||('imggen-'+Date.now()),kind:'tool',title:subPrefix+'生成图像'+(name?' · '+name:''),status:p.item.status==='failed'?'error':'done',detail:imgPath||undefined,imagePath:imgPath||undefined})
+      }
     }
     if(e.method==='turn/completed'){
       if(isSubThread)return
@@ -776,7 +860,11 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
     if(simpleCli){
       const exitPromise=new Promise((resolve,reject)=>{
         child.removeAllListeners('close')
-        child.on('close',code=>code===0&&!failure?resolve():reject(Error('CLI 已退出（'+code+'）'+(stderr?' '+stderr.slice(-400):''))))
+        child.on('close',code=>{
+          if(code===0&&!failure)resolve()
+          else if(failure)reject(failure)
+          else reject(Error('CLI 已退出（'+code+'）'+(stderr?' '+stderr.slice(-400):'')))
+        })
       })
       child.stdin.end()
       await exitPromise
@@ -870,6 +958,7 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
       if(!output.trim())throw Error('Antigravity 未返回正文（可能因工具权限被规划模式取消）')
     }
   }finally{
+    if(deepseekPatchFile){try{unlinkSync(deepseekPatchFile)}catch{}}
     for (const id of runInteractionIds) pendingInteractions.delete(id)
     runInteractionIds.clear()
     stepAdapter?.finalize()

@@ -1,7 +1,7 @@
 // Renderer-side pure logic. Node 22.6+ strips TS types natively, so these .ts modules import directly.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseStepsWithMeta } from '../src/steps.ts'
+import { parseStepsWithMeta, buildTimelineSegments, summarizeStepGroup, fenceSafeCut, extractStepImages } from '../src/steps.ts'
 import { cleanError } from '../src/errors.ts'
 
 const step = o => '::step::' + JSON.stringify(o)
@@ -60,7 +60,7 @@ test('cleanError strips the Electron IPC envelope but keeps the real message', (
   assert.equal(cleanError(null), '未知错误')
 })
 
-import { appendItem, prioritizeItem, removeItem, drainableHeads } from '../src/sendQueue.ts'
+import { appendItem, prioritizeItem, removeItem, drainableHeads, restoreFailed } from '../src/sendQueue.ts'
 
 const q = (id, room, targetList) => ({ id, room, raw: id, targets: targetList, targetList, images: [] })
 
@@ -89,4 +89,151 @@ test('send queue: a room head drains only when its targets are idle in that room
   assert.deepEqual(drainableHeads(s, running, new Set()).map(x => x.id), ['d'])
   assert.deepEqual(drainableHeads(s, running, new Set(['r3'])).map(x => x.id), [])
   assert.deepEqual(drainableHeads(s, [], new Set()).map(x => x.id), ['a', 'c', 'd'])
+})
+
+test('buildTimelineSegments interleaves text and step groups by offset and falls back for legacy logs', () => {
+  // Legacy steps without offset -> returns null so UI keeps legacy layout
+  const legacySteps = parseStepsWithMeta(step({ id: 't1', kind: 'cmd', title: 'Bash · ls', status: 'done' }), true).steps
+  assert.equal(buildTimelineSegments('hello', legacySteps), null)
+
+  // Interleaved: text -> [read, bash] -> text -> [write] -> text
+  const body = '先看配置：\n\n确认了问题。\n\n已完成修改。'
+  const offset1 = '先看配置：'.length
+  const offset2 = '先看配置：\n\n确认了问题。'.length
+  const log = [
+    step({ id: 's1', kind: 'tool', title: 'Read · src/App.tsx', status: 'running', offset: offset1 }),
+    step({ id: 's1', kind: 'tool', title: 'Read · src/App.tsx', status: 'done', offset: offset2 }), // later update must keep original offset1
+    step({ id: 's2', kind: 'cmd', title: 'Bash · npm test', status: 'done', offset: offset1 }),
+    step({ id: 's3', kind: 'tool', title: 'Write · src/steps.ts', status: 'done', offset: offset2 })
+  ].join('\n')
+
+  const { steps } = parseStepsWithMeta(log, true)
+  assert.equal(steps[0].offset, offset1)
+  const segs = buildTimelineSegments(body, steps)
+  assert.ok(segs)
+  assert.equal(segs.length, 5)
+  assert.deepEqual(segs.map(s => s.type), ['text', 'steps', 'text', 'steps', 'text'])
+  assert.equal(segs[0].type === 'text' ? segs[0].content : '', '先看配置：')
+  assert.deepEqual(segs[1].type === 'steps' ? segs[1].steps.map(x => x.id) : [], ['s1', 's2'])
+  assert.equal(segs[2].type === 'text' ? segs[2].content : '', '确认了问题。')
+  assert.deepEqual(segs[3].type === 'steps' ? segs[3].steps.map(x => x.id) : [], ['s3'])
+  assert.equal(segs[4].type === 'text' ? segs[4].content : '', '已完成修改。')
+
+  assert.equal(summarizeStepGroup(segs[1].type === 'steps' ? segs[1].steps : []), '已读取/搜索 1 次，运行 1 条命令')
+  assert.equal(summarizeStepGroup(segs[3].type === 'steps' ? segs[3].steps : []), 'Write · src/steps.ts')
+})
+
+test('interleaving never splits a fenced code block and keeps first-line indentation', () => {
+  const body = '运行下面的命令：\n```bash\nnpm test\nnpm run build\n```\n结果正常。\n\n    indented code\n继续'
+  const midFence = body.indexOf('npm run build')            // a step that "arrived" mid-fence
+  assert.equal(fenceSafeCut(body, midFence), body.indexOf('结果正常'), 'cut moves past the closing fence')
+  assert.equal(fenceSafeCut(body, 3), 3, 'outside a fence the cut is untouched')
+  assert.equal(fenceSafeCut('```js\nstill streaming', 8), '```js\nstill streaming'.length, 'unclosed fence → end')
+
+  const steps = [
+    { id: 'a', kind: 'cmd', title: 'Bash · npm test', status: 'done', offset: midFence },
+    { id: 'b', kind: 'cmd', title: 'Bash · ls', status: 'done', offset: body.indexOf('    indented') }
+  ]
+  const segs = buildTimelineSegments(body, steps)
+  assert.deepEqual(segs.map(x => x.type), ['text', 'steps', 'text', 'steps', 'text'])
+  assert.ok(segs[0].content.endsWith('```'), 'code block stays whole in the first segment')
+  assert.ok(segs[4].content.startsWith('    indented code'), 'indentation preserved')
+})
+
+test('step group summary recognises Chinese titles and the provider meta step', () => {
+  const s = (title, kind = 'tool') => ({ id: title, kind, title, status: 'done' })
+  assert.equal(summarizeStepGroup([s('读取 · a.ts'), s('编辑 · b.ts'), s('执行 · npm test')]), '已读取/搜索 1 次，修改 1 个文件，运行 1 条命令')
+  assert.equal(summarizeStepGroup([s('Readme 生成器'), s('Read · x')]), '已读取/搜索 1 次，调用工具 1 次', '"Readme" is not "read"')
+  const r = parseStepsWithMeta('::step::' + JSON.stringify({ id: 'meta-provider', kind: 'info', title: '渠道 · 智谱', status: 'done' }), true)
+  assert.deepEqual(r.metaTags, ['智谱'])
+  assert.equal(r.steps.length, 0)
+})
+
+test('parseStepsWithMeta ignores truncated leading base64/JSON log fragments', () => {
+  const log = [
+    'u2Ocs2xHMdIQAgh80wSWAQWnIpsb+T+EmeUAhYCGzCJc1jHzk7Z3OTCxfHCHIJ36jiL2XDXPR4nETIGC',
+    '::step::' + JSON.stringify({ id: 'c1', kind: 'cmd', title: 'Bash · ls', status: 'done', offset: 10 })
+  ].join('\n')
+  const { steps } = parseStepsWithMeta(log, true)
+  assert.deepEqual(steps.map(s => s.id), ['c1'])
+})
+
+test('extractStepImages collects explicit imagePath and Read image tool steps without duplicates', () => {
+  const log = [
+    step({ id: 'i1', kind: 'file', title: '查看图像 · fig1.png', status: 'done', imagePath: '/tmp/fig1.png' }),
+    step({ id: 'i2', kind: 'tool', title: 'Read · /tmp/fig2.jpg', status: 'done', detail: '输入：\n{"file_path": "/tmp/fig2.jpg"}' }),
+    step({ id: 'i3', kind: 'tool', title: 'Read · /tmp/fig1.png', status: 'done', detail: '输入：\n{"file_path": "/tmp/fig1.png"}' }),
+    step({ id: 'c1', kind: 'cmd', title: 'Bash · ls', status: 'done' })
+  ].join('\n')
+  const { steps } = parseStepsWithMeta(log, true)
+  const imgs = extractStepImages(steps)
+  assert.deepEqual(imgs, [
+    { path: '/tmp/fig1.png', name: 'fig1.png' },
+    { path: '/tmp/fig2.jpg', name: 'fig2.jpg' }
+  ])
+})
+
+test('file preview labels hide noisy absolute paths and UUID attachment names', async () => {
+  const { friendlyDir, friendlyFileName, imageMetaLine, formatBytes } = await import('../src/filePresentation.ts')
+  const proj = '/Users/lin/Desktop/赛力斯/1218交流报告工作区'
+  assert.equal(friendlyDir(proj + '/build/P43重绘/p43.png', proj), 'build/P43重绘')
+  assert.equal(friendlyDir(proj + '/p43.png', proj), '项目根目录')
+  assert.equal(friendlyDir('/Users/lin/a/b/c/d/e/f.png'), '~/a/…/d/e')
+  assert.equal(friendlyDir('/Users/lin/Library/Application Support/OminiHive/attachments/x.png'), '对话附件')
+  assert.equal(friendlyFileName('', '/x/f7eeadd3-8870-4776-bdb3-ae41b5394330.png'), '图片附件')
+  assert.equal(friendlyFileName('p43_imagegen.png', '/x/p43_imagegen.png'), 'p43_imagegen.png')
+  assert.equal(imageMetaLine({ width: 2048, height: 1152, name: 'a.png', size: 1.2 * 1024 * 1024 }), '2048×1152 · PNG · 1.2 MB')
+  assert.equal(imageMetaLine({ name: 'noext' }), '')
+  assert.equal(formatBytes(undefined), '')
+})
+
+test('sidebar completion dots know which agent finished in which room', async () => {
+  const { finishedAgentsByRoom, runKey, agentColor } = await import('../src/agentMeta.ts')
+  const prev = [runKey('r1', 'Codex'), runKey('r1', 'Claude'), runKey('r2', 'Antigravity')]
+  assert.deepEqual(finishedAgentsByRoom(prev, [{ room: 'r1', agent: 'Claude' }]), { r1: ['Codex'], r2: ['Antigravity'] })
+  assert.deepEqual(finishedAgentsByRoom(prev, [{ room: 'r1', agent: 'Codex' }, { room: 'r1', agent: 'Claude' }, { room: 'r2', agent: 'Antigravity' }]), {})
+  assert.notEqual(agentColor('Codex'), agentColor('Antigravity'))
+  assert.equal(agentColor('Unknown'), 'var(--accent)')
+})
+
+test('step titles show project-relative paths and fold the home folder', async () => {
+  const { shortenPathsInText } = await import('../src/filePresentation.ts')
+  assert.equal(shortenPathsInText('Read · /Users/lin/code/OminiHive/src/App.tsx', '/Users/lin/code/OminiHive'), 'Read · src/App.tsx')
+  assert.equal(shortenPathsInText('Bash · cat "/Users/lin/Desktop/a.txt"', '/Users/lin/code/OminiHive'), 'Bash · cat "~/Desktop/a.txt"')
+  assert.equal(shortenPathsInText('Read · /etc/hosts', ''), 'Read · /etc/hosts')
+})
+
+test('frontend mention parsing routes exactly like the backend', async () => {
+  const { buildMentionTools } = await import('../src/mentions.ts')
+  const { ALL_AGENTS } = await import('../src/agentMeta.ts')
+  const { parseMentionedAgents } = buildMentionTools(ALL_AGENTS)
+  const { routeTargets } = await import('../desktop/store.mjs')
+  const cases = [
+    '@Codex 参考 @Claude 的方案',
+    '@Codex @Claude 对比一下',
+    '看下 @Claude 的方案',
+    '你怎么看 @Antigravity @codex',
+    '@Codex帮我看看',
+    '@Codex，帮我看看',
+    '@all 你怎么看',
+    '@Claude\n第二行提到 @Codex'
+  ]
+  for (const text of cases) {
+    const front = parseMentionedAgents(text).agents
+    let back = []
+    try { back = routeTargets(text, []).agents } catch {}
+    assert.deepEqual([...front].sort(), [...back].sort(), text)
+  }
+})
+
+test('a failed queued dispatch is kept at the head and pauses the room until retried', () => {
+  const item = (id, room, targets) => ({ id, room, raw: id, targets, targetList: targets, images: [] })
+  let state = appendItem({}, item('b', 'r1', ['Codex']))
+  state = restoreFailed(state, item('a', 'r1', ['Claude']), 'CLI 不存在')
+  assert.deepEqual(state.r1.map(x => x.id), ['a', 'b'])
+  assert.equal(state.r1[0].error, 'CLI 不存在')
+  assert.deepEqual(drainableHeads(state, [], new Set()), [])
+  state = prioritizeItem(state, state.r1[0])
+  assert.equal(state.r1[0].error, undefined)
+  assert.deepEqual(drainableHeads(state, [], new Set()).map(x => x.id), ['a'])
 })

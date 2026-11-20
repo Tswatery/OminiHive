@@ -6,6 +6,7 @@ import {
   readdirSync,
   rmSync,
   statSync,
+  unlinkSync,
   writeFileSync
 } from 'node:fs'
 import path from 'node:path'
@@ -179,11 +180,18 @@ export function roomArchiveRelDir(roomId) {
  *
  * Returns a Map<msgId, { seq, relPath, traceRelPath, stepCount, bodyLen, preview }>.
  */
+// Per-room cache of what is already on disk, so a sync only renders messages that changed
+// instead of re-reading every archived file and re-parsing every log.
+const archiveCache = new Map()
+
 export function syncRoomArchive(projectDir, roomId, messages = []) {
   const map = new Map()
   if (!projectDir || !roomId || !existsSync(projectDir)) return map
 
-  const valid = messages.filter(m => m && m.status !== '执行中' && String(m.body || '').trim().length > 0)
+  // Number by position among *all* messages (rowid order), not only finished ones, so a
+  // file name never shifts when agents finish out of order.
+  const numbered = messages.map((m, i) => ({ m, seq: i + 1 }))
+  const valid = numbered.filter(({ m }) => m && m.status !== '执行中' && String(m.body || '').trim().length > 0)
   if (!valid.length) return map
 
   ensureGitExcluded(projectDir)
@@ -191,6 +199,8 @@ export function syncRoomArchive(projectDir, roomId, messages = []) {
   const ctxDir = path.join(rootDir, 'context')
   const dir = path.join(ctxDir, roomId)
   const relDir = roomArchiveRelDir(roomId)
+  let cache = archiveCache.get(dir)
+  if (!cache) { cache = new Map(); archiveCache.set(dir, cache) }
 
   try {
     mkdirSync(ctxDir, { recursive: true })
@@ -203,42 +213,56 @@ export function syncRoomArchive(projectDir, roomId, messages = []) {
       `> 本目录由 OminiHive 维护，仅可读、禁止修改。如需查看某条完整回复或工具执行详情，请直接读取对应文件。`,
       ''
     ]
+    const keep = new Set(['index.md'])
+    const nextCache = new Map()
 
-    for (let i = 0; i < valid.length; i++) {
-      const m = valid[i]
-      const seq = i + 1
+    for (const { m, seq } of valid) {
       const pad = String(seq).padStart(3, '0')
       const base = `${pad}-${safeName(m.author)}`
       const msgFile = `${base}.md`
-      const msgRel = `${relDir}/${msgFile}`
-      writeReadOnlyFile(path.join(dir, msgFile), renderMessageMarkdown(m, seq))
-
-      const steps = m.author === '我' ? [] : parseTraceSteps(m.log)
-      let traceRel = ''
-      if (steps.length > 0) {
-        const traceFile = `${base}.trace.md`
-        traceRel = `${relDir}/${traceFile}`
-        writeReadOnlyFile(path.join(dir, traceFile), renderTraceMarkdown(m, steps))
-      }
-
       const body = String(m.body || '').trim()
-      const preview = body.replace(/\s+/g, ' ').slice(0, 80) + (body.length > 80 ? '…' : '')
-      const metaParts = [`${body.length}字`]
-      if (steps.length > 0) metaParts.push(`工具/日志 ${steps.length}步`)
-      const traceNote = traceRel ? ` | 轨迹: \`${traceRel}\`` : ''
-      indexLines.push(`- [#${pad}] **${m.author}** (${metaParts.join('，')}) → \`${msgRel}\`${traceNote} — ${preview}`)
-
-      map.set(m.id, {
-        seq,
-        relPath: msgRel,
-        traceRelPath: traceRel,
-        stepCount: steps.length,
-        bodyLen: body.length,
-        preview
-      })
+      const log = String(m.log || '')
+      const key = `${base}|${m.status}|${body.length}|${log.length}`
+      let entry = cache.get(m.id)
+      if (!entry || entry.key !== key || !existsSync(path.join(dir, msgFile))) {
+        writeReadOnlyFile(path.join(dir, msgFile), renderMessageMarkdown(m, seq))
+        const steps = m.author === '我' ? [] : parseTraceSteps(log)
+        let traceFile = ''
+        if (steps.length > 0) {
+          traceFile = `${base}.trace.md`
+          writeReadOnlyFile(path.join(dir, traceFile), renderTraceMarkdown(m, steps))
+        }
+        const preview = body.replace(/\s+/g, ' ').slice(0, 80) + (body.length > 80 ? '…' : '')
+        entry = {
+          key,
+          files: traceFile ? [msgFile, traceFile] : [msgFile],
+          meta: {
+            seq,
+            relPath: `${relDir}/${msgFile}`,
+            traceRelPath: traceFile ? `${relDir}/${traceFile}` : '',
+            stepCount: steps.length,
+            bodyLen: body.length,
+            preview
+          }
+        }
+      }
+      nextCache.set(m.id, entry)
+      for (const f of entry.files) keep.add(f)
+      const { meta } = entry
+      const metaParts = [`${meta.bodyLen}字`]
+      if (meta.stepCount > 0) metaParts.push(`工具/日志 ${meta.stepCount}步`)
+      const traceNote = meta.traceRelPath ? ` | 轨迹: \`${meta.traceRelPath}\`` : ''
+      indexLines.push(`- [#${pad}] **${m.author}** (${metaParts.join('，')}) → \`${meta.relPath}\`${traceNote} — ${meta.preview}`)
+      map.set(m.id, meta)
     }
 
     writeReadOnlyFile(path.join(dir, 'index.md'), indexLines.join('\n') + '\n')
+    // Drop files from older numbering schemes / removed messages so stale paths cannot mislead.
+    for (const name of readdirSync(dir)) {
+      if (keep.has(name) || !name.endsWith('.md')) continue
+      try { chmodSync(path.join(dir, name), 0o644); unlinkSync(path.join(dir, name)) } catch {}
+    }
+    archiveCache.set(dir, nextCache)
     lockDir(dir)
   } catch {
     // Non-fatal: never block sending if filesystem denies archive write
@@ -264,6 +288,7 @@ function unlockTree(target) {
 export function removeRoomArchive(projectDir, roomId) {
   if (!projectDir || !roomId) return
   const dir = roomArchiveDir(projectDir, roomId)
+  archiveCache.delete(dir)
   if (!existsSync(dir)) return
   try {
     unlockTree(dir)

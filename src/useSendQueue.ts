@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import {
-  appendItem, drainableHeads, prioritizeItem, removeItem,
+  appendItem, drainableHeads, prioritizeItem, removeItem, restoreFailed,
   type QueuedMessage, type QueueState, type RunningJob
 } from './sendQueue'
 
@@ -13,20 +13,36 @@ export type { QueuedMessage } from './sendQueue'
  * `running` should be the main process's running-job list (a fresh array on every tree refresh,
  * which also re-checks the queue after an in-flight dispatch settles).
  */
-export function useSendQueue<A extends string>(running: RunningJob[] | undefined, dispatch: (item: QueuedMessage<A>) => Promise<unknown>) {
+export function useSendQueue<A extends string>(
+  running: RunningJob[] | undefined,
+  dispatch: (item: QueuedMessage<A>) => Promise<true | string>
+) {
   const [queuedByRoom, setQueuedByRoom] = useState<QueueState<A>>({})
-  const draining = useRef(new Set<string>())
+  // room -> agents being dispatched. A room is released as soon as those agents show up as
+  // running (the backend accepted the run), not when the whole run finishes, so the next
+  // item for a *different* agent is not stuck behind a long task.
+  const draining = useRef(new Map<string, A[]>())
   const dispatchRef = useRef(dispatch)
   dispatchRef.current = dispatch
 
   useEffect(() => {
-    for (const head of drainableHeads(queuedByRoom, running || [], draining.current)) {
-      draining.current.add(head.room)
+    const busy = new Set((running || []).map(j => j.room + '\u0000' + j.agent))
+    for (const [room, agents] of draining.current) {
+      if (agents.some(a => busy.has(room + '\u0000' + a))) draining.current.delete(room)
+    }
+    for (const head of drainableHeads(queuedByRoom, running || [], new Set(draining.current.keys()))) {
+      draining.current.set(head.room, head.targetList)
       setQueuedByRoom(prev => removeItem(prev, head.room, head.id))
       void Promise.resolve()
         .then(() => dispatchRef.current(head))
-        .catch(() => {})
-        .finally(() => { draining.current.delete(head.room) })
+        .catch(e => String((e as Error)?.message || e || '发送失败'))
+        .then(result => {
+          // Never drop a message silently: a failed dispatch goes back to the head with its error.
+          if (result !== true) setQueuedByRoom(prev => restoreFailed(prev, head, result))
+        })
+        .finally(() => {
+          if (draining.current.get(head.room) === head.targetList) draining.current.delete(head.room)
+        })
     }
   }, [running, queuedByRoom])
 

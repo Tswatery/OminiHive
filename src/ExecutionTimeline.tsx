@@ -1,21 +1,31 @@
-import React, { useEffect, useRef, useState } from 'react'
-import { Check, ChevronRight, ExternalLink, ShieldAlert, Terminal } from 'lucide-react'
+import React, { createContext, useContext, useEffect, useRef, useState } from 'react'
+import { Check, ChevronRight, ExternalLink, Images, ShieldAlert } from 'lucide-react'
 import { cleanError } from './errors'
+import { LocalImageThumb, type LightboxImageItem } from './ImageLightbox'
+import { shortenPathsInText } from './filePresentation'
+
+/** Project root of the current room, used to show step paths relative to it. */
+export const ProjectDirContext = createContext<string>('')
 
 import {
+  extractStepImages,
   formatDuration,
+  summarizeStepGroup,
   type StepBlock,
   type StepInteractionOption
 } from './steps'
 
 export {
+  buildTimelineSegments,
   formatDuration,
   parseStepsWithMeta,
+  summarizeStepGroup,
   type StepBlock,
   type StepEndState,
   type StepInteraction,
   type StepInteractionOption,
-  type ParsedStepsResult
+  type ParsedStepsResult,
+  type TimelineSegment
 } from './steps'
 
 export function StepTimelineItem({
@@ -34,6 +44,7 @@ export function StepTimelineItem({
   }) => Promise<unknown>
   onFocusAntigravity: () => Promise<unknown>
 }) {
+  const projectDir = useContext(ProjectDirContext)
   const [manualOpen, setManualOpen] = useState<boolean | null>(null)
   const [submittingId, setSubmittingId] = useState('')
   const [submittedLabel, setSubmittedLabel] = useState('')
@@ -112,7 +123,7 @@ export function StepTimelineItem({
             ? <span className="pulse-dot mini" />
             : step.status === 'error' ? '✕' : step.status === 'stopped' ? '–' : '✓'}
         </span>
-        <span className={'step-title' + (step.kind === 'cmd' ? ' is-cmd' : '')}>{step.title}</span>
+        <span className={'step-title' + (step.kind === 'cmd' ? ' is-cmd' : '')} title={step.title}>{shortenPathsInText(step.title, projectDir)}</span>
         {step.status === 'running' && <span className="step-badge running">运行中</span>}
         {step.status === 'waiting' && <span className="step-badge waiting">等待确认</span>}
         {step.status === 'error' && <span className="step-badge error">失败</span>}
@@ -214,18 +225,75 @@ export function StepTimelineItem({
   )
 }
 
+function StepImageGallery({
+  steps,
+  roomId,
+  onOpenLightbox,
+  onFileContextMenu
+}: {
+  steps: StepBlock[]
+  roomId?: string
+  onOpenLightbox?: (items: LightboxImageItem[], index: number) => void
+  onFileContextMenu?: (e: React.MouseEvent, absPath: string, allowPreview?: boolean) => void
+}) {
+  const images = extractStepImages(steps)
+  const [open, setOpen] = useState(true)
+  if (!images.length) return null
+
+  return (
+    <div className="step-img-gallery">
+      <button type="button" className="step-img-gallery-head" onClick={() => setOpen(v => !v)}>
+        <Images size={13} />
+        <span>已查看 {images.length} 张图像</span>
+        <ChevronRight size={12} className={'step-caret ' + (open ? 'open' : '')} />
+      </button>
+      {open && (
+        <div className="step-img-strip">
+          {images.map((img, i) => (
+            <LocalImageThumb
+              key={img.path}
+              path={img.path}
+              roomId={roomId}
+              alt={img.name}
+              onOpen={(resolvedPath, dataUrl) => {
+                if (onOpenLightbox) {
+                  const list: LightboxImageItem[] = images.map((it, idx) =>
+                    idx === i ? { path: resolvedPath, name: it.name, dataUrl } : { path: it.path, name: it.name }
+                  )
+                  onOpenLightbox(list, i)
+                } else {
+                  void window.hive.openPath(resolvedPath, roomId)
+                }
+              }}
+              onContextMenu={(e, absPath) => onFileContextMenu?.(e, absPath, true)}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function ExecutionTimeline({
   steps,
   isRunning,
+  connected = false,
+  hasBody = false,
   duration,
   defaultExpanded = false,
+  roomId,
   onRespondInteraction,
-  onFocusAntigravity
+  onFocusAntigravity,
+  onOpenLightbox,
+  onFileContextMenu
 }: {
   steps: StepBlock[]
   isRunning: boolean
+  connected?: boolean
+  hasBody?: boolean
   duration?: number
   defaultExpanded?: boolean
+  roomId?: string
   onRespondInteraction: (payload: {
     cascadeId: string
     trajectoryId?: string
@@ -233,6 +301,8 @@ export function ExecutionTimeline({
     payload: Record<string, unknown>
   }) => Promise<unknown>
   onFocusAntigravity: () => Promise<unknown>
+  onOpenLightbox?: (items: LightboxImageItem[], index: number) => void
+  onFileContextMenu?: (e: React.MouseEvent, absPath: string, allowPreview?: boolean) => void
 }) {
   const [showAllLive, setShowAllLive] = useState(false)
   if (isRunning) {
@@ -244,6 +314,7 @@ export function ExecutionTimeline({
         ? [...steps.filter(s => s.status === 'waiting' && !tail.includes(s)), ...tail]
         : tail
     const hiddenCount = Math.max(0, steps.length - liveSteps.length)
+    if (liveSteps.length === 0 && hasBody) return null
 
     return (
       <div className="step-timeline live">
@@ -264,11 +335,18 @@ export function ExecutionTimeline({
             />
           ))
         ) : (
-          <div className="live-progress">
-            <Terminal size={12} />
-            <span>正在准备上下文并连接客户端…</span>
+          <div className={'step-row ' + (connected ? 'done' : 'info') + ' info live-progress-row'}>
+            <button type="button" className="step-row-head" disabled>
+              <span className={'step-dot ' + (connected ? 'done' : 'running')}>
+                {connected ? '✓' : <span className="pulse-dot mini" />}
+              </span>
+              <span className="step-title">
+                {connected ? '已连接客户端，模型思考中…' : '正在准备上下文并连接客户端…'}
+              </span>
+            </button>
           </div>
         )}
+        <StepImageGallery steps={steps} roomId={roomId} onOpenLightbox={onOpenLightbox} onFileContextMenu={onFileContextMenu} />
       </div>
     )
   }
@@ -276,22 +354,112 @@ export function ExecutionTimeline({
   if (steps.length === 0) return null
 
   return (
-    <details className="log-box" open={defaultExpanded || undefined}>
-      <summary>
-        <ChevronRight size={13} className="log-caret" />
-        <span>{steps.length} 步{duration ? ` · ${formatDuration(duration)}` : ''}</span>
-      </summary>
-      <div className="step-timeline">
-        {steps.map(s => (
-          <StepTimelineItem
-            key={s.id}
-            step={s}
-            defaultOpen={s.status === 'error'}
-            onRespondInteraction={onRespondInteraction}
-            onFocusAntigravity={onFocusAntigravity}
-          />
-        ))}
+    <div className="step-group-wrap">
+      <details className="log-box" open={defaultExpanded || undefined}>
+        <summary>
+          <ChevronRight size={13} className="log-caret" />
+          <span>{steps.length} 步{duration ? ` · ${formatDuration(duration)}` : ''}</span>
+        </summary>
+        <div className="step-timeline">
+          {steps.map(s => (
+            <StepTimelineItem
+              key={s.id}
+              step={s}
+              defaultOpen={s.status === 'error'}
+              onRespondInteraction={onRespondInteraction}
+              onFocusAntigravity={onFocusAntigravity}
+            />
+          ))}
+        </div>
+      </details>
+      <StepImageGallery steps={steps} roomId={roomId} onOpenLightbox={onOpenLightbox} onFileContextMenu={onFileContextMenu} />
+    </div>
+  )
+}
+
+export function InlineStepGroup({
+  steps,
+  isActiveGroup,
+  defaultExpanded = false,
+  roomId,
+  onRespondInteraction,
+  onFocusAntigravity,
+  onOpenLightbox,
+  onFileContextMenu
+}: {
+  steps: StepBlock[]
+  isActiveGroup: boolean
+  defaultExpanded?: boolean
+  roomId?: string
+  onRespondInteraction: (payload: {
+    cascadeId: string
+    trajectoryId?: string
+    stepIndex: number
+    payload: Record<string, unknown>
+  }) => Promise<unknown>
+  onFocusAntigravity: () => Promise<unknown>
+  onOpenLightbox?: (items: LightboxImageItem[], index: number) => void
+  onFileContextMenu?: (e: React.MouseEvent, absPath: string, allowPreview?: boolean) => void
+}) {
+  const [showAllLive, setShowAllLive] = useState(false)
+  if (steps.length === 0) return null
+
+  if (isActiveGroup) {
+    const hasWaiting = steps.some(s => s.status === 'waiting')
+    const tail = steps.slice(-4)
+    const liveSteps = showAllLive
+      ? steps
+      : hasWaiting
+        ? [...steps.filter(s => s.status === 'waiting' && !tail.includes(s)), ...tail]
+        : tail
+    const hiddenCount = Math.max(0, steps.length - liveSteps.length)
+
+    return (
+      <div className="step-group-wrap">
+        <div className="step-timeline live inline-step-live">
+          {(hiddenCount > 0 || showAllLive) && steps.length > 4 && (
+            <button type="button" className="step-hidden-hint" onClick={() => setShowAllLive(v => !v)}>
+              <ChevronRight size={11} className={'step-caret ' + (showAllLive ? 'open' : '')} />
+              {showAllLive ? '只看最近步骤' : `已完成前 ${hiddenCount} 步 · 展开`}
+            </button>
+          )}
+          {liveSteps.map(s => (
+            <StepTimelineItem
+              key={s.id}
+              step={s}
+              defaultOpen={s.status === 'running' && s.kind === 'thought'}
+              onRespondInteraction={onRespondInteraction}
+              onFocusAntigravity={onFocusAntigravity}
+            />
+          ))}
+        </div>
+        <StepImageGallery steps={steps} roomId={roomId} onOpenLightbox={onOpenLightbox} onFileContextMenu={onFileContextMenu} />
       </div>
-    </details>
+    )
+  }
+
+  const label = summarizeStepGroup(steps, false)
+  return (
+    <div className="step-group-wrap">
+      <details className="log-box inline-step-group" open={defaultExpanded || undefined}>
+        <summary>
+          <ChevronRight size={13} className="log-caret" />
+          <span className="inline-step-summary">{label}</span>
+          {steps.length > 1 && <span className="inline-step-count">· {steps.length} 步</span>}
+        </summary>
+        <div className="step-timeline">
+          {steps.map(s => (
+            <StepTimelineItem
+              key={s.id}
+              step={s}
+              defaultOpen={s.status === 'error'}
+              onRespondInteraction={onRespondInteraction}
+              onFocusAntigravity={onFocusAntigravity}
+            />
+          ))}
+        </div>
+      </details>
+      <StepImageGallery steps={steps} roomId={roomId} onOpenLightbox={onOpenLightbox} onFileContextMenu={onFileContextMenu} />
+    </div>
   )
 }

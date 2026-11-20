@@ -130,7 +130,7 @@ export function ComposerToolbar({
             onClick={skills.onToggle}
           >
             <Sparkles size={12} />
-            <span>Skills {skills.count}</span>
+            <span><em className="skills-word">Skills </em>{skills.count}</span>
           </button>
         )}
 

@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite'
 import { randomUUID } from 'node:crypto'
-import { realpathSync, statSync } from 'node:fs'
+import { existsSync, realpathSync, statSync } from 'node:fs'
 import path from 'node:path'
 import { homedir } from 'node:os'
 import { syncRoomArchive, removeRoomArchive, roomArchiveRelDir } from './context-archive.mjs'
@@ -15,6 +15,29 @@ export const PROMPT_CONTEXT_CLOSE = '</group_context>'
 export const PROMPT_TASK_OPEN = '<user_task>'
 export const PROMPT_TASK_CLOSE = '</user_task>'
 export const PROMPT_TASK_MARKER = '本轮用户请求：'
+
+// Inlined context must stay bounded: several CLIs receive the prompt through argv
+// (macOS ARG_MAX is 1MB) and huge prompts also waste the target model's context.
+export const INLINE_MESSAGE_CHARS = 30000
+export const INLINE_TOTAL_CHARS = 60000
+const INLINE_MIN_CHARS = 2000
+
+/** Drop inline base64 previews for attachments whose file still exists; the UI loads them on demand. */
+export function slimAttachments(raw) {
+  if (!raw) return raw || ''
+  try {
+    const list = JSON.parse(raw)
+    if (!Array.isArray(list)) return raw
+    return JSON.stringify(list.map(a => (a && a.dataUrl && a.path && existsSync(a.path) ? { ...a, dataUrl: '' } : a)))
+  } catch {
+    return raw
+  }
+}
+
+export function capInlineBody(body, limit, archivePath) {
+  if (body.length <= limit) return body
+  return body.slice(0, limit) + `\n\n…（该回复共 ${body.length} 字，此处仅保留前 ${limit} 字；完整内容见只读归档 ${archivePath}）`
+}
 
 function normalizeAgent(name) {
   return KNOWN_AGENTS.find(a => a.toLowerCase() === String(name || '').toLowerCase()) || null
@@ -98,8 +121,11 @@ export function summarizeTitle(raw = '') {
 
 export class Store {
   constructor(file) {
+    this.msgTrack = new Map()
     this.db = new DatabaseSync(file)
-    this.db.exec(`PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;
+    this.stmts = new Map()
+    // WAL + NORMAL stays crash-safe for the database while avoiding an fsync per streamed delta.
+    this.db.exec(`PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
       CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,dir TEXT UNIQUE NOT NULL,name TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS rooms(id TEXT PRIMARY KEY,project TEXT REFERENCES projects(id),title TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,room TEXT REFERENCES rooms(id),author TEXT,body TEXT,log TEXT,status TEXT,time INTEGER,duration INTEGER DEFAULT 0,attachments TEXT DEFAULT '');
@@ -112,9 +138,18 @@ export class Store {
     try { this.db.exec('ALTER TABLE sessions ADD COLUMN last_seen_rowid INTEGER DEFAULT 0') } catch {}
     try { this.db.exec('ALTER TABLE rooms ADD COLUMN title_locked INTEGER DEFAULT 0') } catch {}
   }
-  all(sql, ...a) { return this.db.prepare(sql).all(...a) }
-  get(sql, ...a) { return this.db.prepare(sql).get(...a) }
-  run(sql, ...a) { return this.db.prepare(sql).run(...a) }
+  stmt(sql) {
+    let st = this.stmts.get(sql)
+    if (!st) {
+      st = this.db.prepare(sql)
+      if (this.stmts.size > 300) this.stmts.clear()
+      this.stmts.set(sql, st)
+    }
+    return st
+  }
+  all(sql, ...a) { return this.stmt(sql).all(...a) }
+  get(sql, ...a) { return this.stmt(sql).get(...a) }
+  run(sql, ...a) { return this.stmt(sql).run(...a) }
 
   project(dir) {
     dir = canonical(dir)
@@ -211,6 +246,28 @@ export class Store {
     return this.all('SELECT * FROM messages WHERE room=? ORDER BY rowid', room)
   }
 
+  /**
+   * Incremental read for the UI: `known` maps message id -> signature the renderer
+   * already has. Only new/changed rows are returned (with attachment previews slimmed),
+   * so streaming does not re-send every log and image on each change event.
+   */
+  messagesDelta(room, known = {}) {
+    const sigs = this.all(
+      `SELECT id, status || ':' || COALESCE(duration,0) || ':' || length(CAST(body AS BLOB)) || ':' ||
+              length(CAST(log AS BLOB)) || ':' || length(CAST(COALESCE(attachments,'') AS BLOB)) AS sig
+       FROM messages WHERE room=? ORDER BY rowid`,
+      room
+    )
+    const changedIds = sigs.filter(r => known?.[r.id] !== r.sig).map(r => r.id)
+    const sigById = new Map(sigs.map(r => [r.id, r.sig]))
+    const rows = []
+    for (const id of changedIds) {
+      const row = this.get('SELECT * FROM messages WHERE id=?', id)
+      if (row) rows.push({ ...row, attachments: slimAttachments(row.attachments), sig: sigById.get(id) })
+    }
+    return { ids: sigs.map(r => r.id), rows }
+  }
+
   syncArchive(room) {
     const project = this.get('SELECT p.dir FROM projects p JOIN rooms r ON p.id=r.project WHERE r.id=?', room)
     if (!project) return new Map()
@@ -281,9 +338,11 @@ export class Store {
     const totalArchived = archiveMap?.size || 0
 
     const blocks = []
+    let inlineBudget = INLINE_TOTAL_CHARS
     for (const m of inlined) {
-      const body = String(m.body || '').trim()
       const meta = archiveMap?.get(m.id)
+      const body = capInlineBody(String(m.body || '').trim(), Math.min(INLINE_MESSAGE_CHARS, Math.max(INLINE_MIN_CHARS, inlineBudget)), meta?.relPath || `${relDir}/index.md`)
+      inlineBudget -= body.length
       let block = `[${m.author}]:\n${body}`
       if (meta?.traceRelPath) {
         block += `\n\n（该回复的完整工具/命令执行轨迹：${meta.traceRelPath}）`
@@ -446,6 +505,17 @@ export class Store {
     )
   }
 
+  _getMsgTrack(id) {
+    let track = this.msgTrack.get(id)
+    if (!track) {
+      const row = this.get('SELECT body, length(log) AS logLen FROM messages WHERE id=?', id)
+      const body = row?.body || ''
+      track = { bodyLen: body.length, tail: body.slice(-2), logLen: Number(row?.logLen || 0), hadStepSinceText: false, seenStepIds: new Set() }
+      this.msgTrack.set(id, track)
+    }
+    return track
+  }
+
   record(id, room, agent, type, value) {
     if (type === 'session') {
       this.run(
@@ -458,8 +528,85 @@ export class Store {
       return
     }
     if (!value) return
-    if (type === 'text') this.run('UPDATE messages SET body=body||? WHERE id=?', value, id)
-    if (type === 'log') this.run("UPDATE messages SET log=substr(log||?,-524288) WHERE id=?", value + '\n', id)
+    if (type === 'text') {
+      const track = this._getMsgTrack(id)
+      let chunk = String(value)
+      if (track.hadStepSinceText && chunk.trim()) {
+        if (track.bodyLen > 0 && !chunk.startsWith('\n')) {
+          if (track.tail === '\n\n') {
+            // already paragraph-separated
+          } else if (track.tail.endsWith('\n')) {
+            chunk = '\n' + chunk
+          } else {
+            chunk = '\n\n' + chunk
+          }
+        }
+        track.hadStepSinceText = false
+      }
+      this.run('UPDATE messages SET body=body||? WHERE id=?', chunk, id)
+      track.bodyLen += chunk.length
+      track.tail = (track.tail + chunk).slice(-2)
+      return
+    }
+    if (type === 'log') {
+      const META_PREFIXES = ['模型 · ', '请求思考强度 · ', '思考强度 · ', '上下文 · ', '提供商 · ', '渠道 · ']
+      const LOG_MAX = 524288
+      const track = this._getMsgTrack(id)
+      let logVal = String(value)
+      if (logVal.startsWith('::step::')) {
+        try {
+          const step = JSON.parse(logVal.slice(8))
+          const title = String(step?.title || '')
+          const isMeta = META_PREFIXES.some(p => title.startsWith(p))
+          if (step && !isMeta) {
+            const stepId = typeof step.id === 'string' ? step.id : ''
+            const isNewStep = !stepId || !track.seenStepIds.has(stepId)
+            if (isNewStep) {
+              if (stepId) track.seenStepIds.add(stepId)
+              if (typeof step.offset !== 'number') step.offset = track.bodyLen
+              if (track.bodyLen > 0) track.hadStepSinceText = true
+              logVal = '::step::' + JSON.stringify(step)
+            }
+          }
+        } catch {}
+      }
+      const line = logVal + '\n'
+      if (track.logLen + line.length <= LOG_MAX) {
+        this.run('UPDATE messages SET log=log||? WHERE id=?', line, id)
+        track.logLen += line.length
+      } else {
+        const cur = (this.get('SELECT log FROM messages WHERE id=?', id)?.log || '') + line
+        const isMetaLine = l => {
+          if (META_PREFIXES.some(p => l.startsWith(p))) return true
+          if (l.startsWith('::step::')) {
+            try {
+              const t = String(JSON.parse(l.slice(8))?.title || '')
+              return META_PREFIXES.some(p => t.startsWith(p))
+            } catch {}
+          }
+          return false
+        }
+        const allLines = cur.split('\n').filter(Boolean)
+        const metaLines = []
+        const bodyLines = []
+        for (const l of allLines) (isMetaLine(l) ? metaLines : bodyLines).push(l)
+        const metaBlock = metaLines.length ? metaLines.join('\n') + '\n' : ''
+        // Trim well below the cap so the next lines do not trigger another full rewrite.
+        const budget = Math.max(4096, Math.floor(LOG_MAX * 0.7) - metaBlock.length)
+        const kept = []
+        let used = 0
+        for (let i = bodyLines.length - 1; i >= 0; i--) {
+          const entry = bodyLines[i]
+          if (used + entry.length + 1 > budget && kept.length > 0) break
+          kept.push(entry)
+          used += entry.length + 1
+        }
+        kept.reverse()
+        const trimmed = metaBlock + (kept.length ? kept.join('\n') + '\n' : '')
+        this.run('UPDATE messages SET log=? WHERE id=?', trimmed, id)
+        track.logLen = trimmed.length
+      }
+    }
   }
 
   listSessions(room) {
@@ -481,6 +628,7 @@ export class Store {
   }
 
   finish(id, status) {
+    this.msgTrack.delete(id)
     const row = this.get('SELECT room, time FROM messages WHERE id=?', id)
     const duration = row?.time ? Math.max(0, Date.now() - row.time) : 0
     this.run('UPDATE messages SET status=?, duration=? WHERE id=?', status, duration, id)

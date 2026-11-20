@@ -1,12 +1,7 @@
-import { useState, useEffect } from 'react'
-import { Dialog, IconButton } from '@radix-ui/themes'
-import {
-  ChevronRight, ExternalLink, File, FileCode2, FileImage, FileText,
-  Folder, FolderOpen, MessageSquarePlus, RefreshCw, X
-} from 'lucide-react'
-import { MarkdownView } from './MarkdownView'
+import React, { useState, useEffect, useRef } from 'react'
+import { ChevronRight, GitBranch, MessageSquarePlus, RefreshCw, X } from 'lucide-react'
 import { ScrollArea } from './OverlayScrollbar'
-import { cleanError } from './errors'
+import { FileTypeIcon } from './FileTypeIcon'
 
 export type FileEntry = {
   name: string
@@ -15,6 +10,15 @@ export type FileEntry = {
   isDir: boolean
   size: number
   ext: string
+  gitStatus?: 'M' | 'A' | 'D' | 'R' | 'U'
+}
+
+export type GitStatusResult = {
+  isRepo: boolean
+  branch: string
+  files: Record<string, 'M' | 'A' | 'D' | 'R' | 'U'>
+  dirs: Record<string, boolean>
+  changes: FileEntry[]
 }
 
 export type PreviewResult =
@@ -23,55 +27,101 @@ export type PreviewResult =
   | { kind: 'markdown' | 'text'; name: string; path: string; ext: string; size: number; truncated?: boolean; content: string }
   | { kind: 'binary'; name: string; path: string; size: number; note?: string }
 
-function FileIcon({ entry }: { entry: FileEntry }) {
-  if (entry.isDir) return <Folder size={14} className="ficon dir" />
-  if (entry.ext === '.pdf') return <FileText size={14} className="ficon pdf" />
-  if (['.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg', '.bmp'].includes(entry.ext)) {
-    return <FileImage size={14} className="ficon img" />
-  }
-  if (['.ts', '.tsx', '.js', '.jsx', '.mjs', '.py', '.go', '.rs', '.json', '.md', '.css'].includes(entry.ext)) {
-    return <FileCode2 size={14} className="ficon code" />
-  }
-  return <File size={14} className="ficon" />
-}
-
-function formatSize(bytes: number) {
-  if (bytes < 1024) return bytes + ' B'
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
-  return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
+function GitStatusBadge({ code }: { code?: 'M' | 'A' | 'D' | 'R' | 'U' }) {
+  if (!code) return null
+  const label = code === 'U' || code === 'A' ? '+' : code === 'D' ? '−' : code
+  const title = code === 'U' ? '未跟踪（新增）' : code === 'A' ? '已暂存新增' : code === 'D' ? '已删除' : code === 'R' ? '已重命名' : '已修改'
+  return <span className={'git-badge ' + code.toLowerCase()} title={title}>{label}</span>
 }
 
 export function FileDrawer({
   roomId,
   projectName,
+  activePreviewPath,
   onClose,
-  onInsertPath
+  onInsertPath,
+  onPreviewFile,
+  onFileContextMenu
 }: {
   roomId: string
   projectName: string
+  activePreviewPath?: string
   onClose: () => void
   onInsertPath: (relPath: string) => void
+  onPreviewFile: (filePath: string) => void
+  onFileContextMenu?: (e: React.MouseEvent, absPath: string, allowPreview?: boolean) => void
 }) {
   const [childrenMap, setChildrenMap] = useState<Record<string, FileEntry[]>>({})
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
   const [loading, setLoading] = useState(false)
-  const [preview, setPreview] = useState<PreviewResult | null>(null)
-  const [previewErr, setPreviewErr] = useState('')
+  const [git, setGit] = useState<GitStatusResult>({ isRepo: false, branch: '', files: {}, dirs: {}, changes: [] })
+  const [tab, setTab] = useState<'all' | 'changes'>('all')
+  const [width, setWidth] = useState(() => {
+    const saved = Number(localStorage.getItem('ominihive:files-width'))
+    return Number.isFinite(saved) && saved >= 196 ? Math.min(460, Math.round(saved)) : 250
+  })
+  const [resizing, setResizing] = useState(false)
+  const widthRef = useRef(width)
+  widthRef.current = width
+
+  function startResize(e: React.MouseEvent) {
+    e.preventDefault()
+    const startX = e.clientX
+    const startW = widthRef.current
+    setResizing(true)
+    const prevCursor = document.body.style.cursor
+    const prevSelect = document.body.style.userSelect
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+    const onMove = (ev: MouseEvent) => {
+      const next = Math.max(196, Math.min(460, Math.round(startW + (startX - ev.clientX))))
+      widthRef.current = next
+      setWidth(next)
+    }
+    const onUp = () => {
+      setResizing(false)
+      document.body.style.cursor = prevCursor
+      document.body.style.userSelect = prevSelect
+      try { localStorage.setItem('ominihive:files-width', String(widthRef.current)) } catch {}
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
+  function resetWidth() {
+    setWidth(250)
+    try { localStorage.setItem('ominihive:files-width', '250') } catch {}
+  }
+
+  const roomRef = useRef(roomId)
+  roomRef.current = roomId
 
   async function loadDir(relDir = '') {
     if (!roomId) return
+    const forRoom = roomId
     if (!relDir) setLoading(true)
     try {
-      const list = await window.hive.files(roomId, relDir)
+      const [list, gitRes] = await Promise.all([
+        window.hive.files(forRoom, relDir),
+        !relDir ? window.hive.gitStatus(forRoom).catch(() => ({ isRepo: false, branch: '', files: {}, dirs: {}, changes: [] })) : Promise.resolve(null)
+      ])
+      // Switched to another room/project meanwhile: drop the stale listing.
+      if (roomRef.current !== forRoom) return
       setChildrenMap(prev => ({ ...prev, [relDir]: list }))
+      if (gitRes) setGit(gitRes)
+    } catch {
+      // Unreadable directory: keep the tree as is instead of an unhandled rejection.
     } finally {
-      if (!relDir) setLoading(false)
+      if (!relDir && roomRef.current === forRoom) setLoading(false)
     }
   }
 
   useEffect(() => {
     setChildrenMap({})
     setExpanded({})
+    setTab('all')
     void loadDir('')
   }, [roomId])
 
@@ -83,40 +133,38 @@ export function FileDrawer({
     }
   }
 
-  async function openPreview(entry: FileEntry) {
-    setPreviewErr('')
-    try {
-      const res = await window.hive.previewFile(roomId, entry.path)
-      setPreview(res)
-    } catch (e) {
-      setPreviewErr(cleanError(e))
-    }
-  }
-
   function renderNodes(relDir: string, depth: number) {
     const items = childrenMap[relDir] || []
     return items.map(entry => {
       const isOpen = Boolean(expanded[entry.relPath])
+      const relKey = entry.relPath.replace(/\\/g, '/')
+      const gitCode = entry.isDir ? undefined : git.files[relKey]
+      const dirHasChange = entry.isDir && Boolean(git.dirs[relKey])
+      const isSelected = Boolean(activePreviewPath && activePreviewPath === entry.path)
+
       return (
         <div key={entry.relPath}>
           <div
-            className="file-row"
+            className={'file-row' + (isSelected ? ' selected' : '') + (gitCode ? ' git-' + gitCode.toLowerCase() : '')}
             style={{ paddingLeft: 10 + depth * 14 }}
-            onClick={() => (entry.isDir ? void toggleDir(entry) : void openPreview(entry))}
-            title={entry.relPath}
+            onClick={() => (entry.isDir ? void toggleDir(entry) : onPreviewFile(entry.path))}
+            onContextMenu={e => { if (!entry.isDir) onFileContextMenu?.(e, entry.path, true) }}
+            title={entry.path}
           >
             {entry.isDir ? (
               <>
                 <ChevronRight size={12} className={'file-caret ' + (isOpen ? 'open' : '')} />
-                {isOpen ? <FolderOpen size={14} className="ficon dir" /> : <Folder size={14} className="ficon dir" />}
+                <FileTypeIcon name={entry.name} isDir isOpen={isOpen} size={15} />
               </>
             ) : (
               <>
                 <span className="file-caret-pad" />
-                <FileIcon entry={entry} />
+                <FileTypeIcon name={entry.name} ext={entry.ext} size={15} />
               </>
             )}
             <span className="file-name">{entry.name}</span>
+            {dirHasChange && <span className="git-dir-dot" title="目录内有 Git 变更" />}
+            {gitCode && <GitStatusBadge code={gitCode} />}
             {!entry.isDir && (
               <button
                 type="button"
@@ -142,10 +190,28 @@ export function FileDrawer({
   }
 
   return (
-    <aside className="file-drawer" aria-label="项目文件目录">
+    <aside
+      className={'file-drawer' + (resizing ? ' resizing' : '')}
+      style={{ width, flexBasis: width }}
+      aria-label="项目文件目录"
+    >
+      <div
+        className="drawer-resizer"
+        onMouseDown={startResize}
+        onDoubleClick={resetWidth}
+        title="左右拖动调整文件栏宽度（双击重置）"
+        role="separator"
+        aria-orientation="vertical"
+      />
       <div className="file-drawer-head">
         <span className="file-drawer-title" title={projectName}>{projectName} · 文件</span>
-        <button type="button" className="icon-btn" title="刷新目录" onClick={() => void loadDir('')}>
+        {git.isRepo && git.branch && (
+          <span className="file-git-branch" title={'Git 分支：' + git.branch}>
+            <GitBranch size={11} />
+            <span>{git.branch}</span>
+          </span>
+        )}
+        <button type="button" className="icon-btn" title="刷新目录与 Git 状态" onClick={() => void loadDir('')}>
           <RefreshCw size={13} className={loading ? 'spin' : ''} />
         </button>
         <button type="button" className="icon-btn" title="关闭文件栏" onClick={onClose}>
@@ -153,66 +219,64 @@ export function FileDrawer({
         </button>
       </div>
 
-      {previewErr && <div className="file-err">{previewErr}</div>}
+      {git.isRepo && (
+        <div className="file-drawer-tabs">
+          <button type="button" className={tab === 'all' ? 'active' : ''} onClick={() => setTab('all')}>
+            全部文件
+          </button>
+          <button type="button" className={tab === 'changes' ? 'active' : ''} onClick={() => setTab('changes')}>
+            已更改{git.changes.length > 0 ? ` (${git.changes.length})` : ''}
+          </button>
+        </div>
+      )}
 
       <ScrollArea className="file-tree" insetTop={4} insetBottom={4}>
-        {renderNodes('', 0)}
-        {!loading && !(childrenMap['']?.length) && (
-          <div className="file-empty">目录为空</div>
-        )}
-      </ScrollArea>
-
-      <Dialog.Root open={Boolean(preview)} onOpenChange={open => { if (!open) setPreview(null) }}>
-        <Dialog.Content className="preview-dialog" maxWidth="88vw">
-          {preview && (
-            <>
-              <div className="preview-head">
-                <div className="preview-title">
-                  <strong>{preview.name}</strong>
-                  <span>{formatSize(preview.size)}</span>
-                </div>
-                <div className="preview-actions">
+        {tab === 'changes' ? (
+          git.changes.length > 0 ? (
+            git.changes.map(entry => {
+              const isSelected = Boolean(activePreviewPath && activePreviewPath === entry.path)
+              const dirLabel = entry.relPath.includes('/') ? entry.relPath.slice(0, entry.relPath.lastIndexOf('/')) : ''
+              return (
+                <div
+                  key={entry.relPath}
+                  className={'file-row' + (isSelected ? ' selected' : '') + (entry.gitStatus ? ' git-' + entry.gitStatus.toLowerCase() : '')}
+                  style={{ paddingLeft: 10 }}
+                  onClick={() => { if (entry.gitStatus !== 'D') onPreviewFile(entry.path) }}
+                  onContextMenu={e => onFileContextMenu?.(e, entry.path, entry.gitStatus !== 'D')}
+                  title={entry.path}
+                >
+                  <FileTypeIcon name={entry.name} ext={entry.ext} size={15} />
+                  <span className="file-name">
+                    {entry.name}
+                    {dirLabel && <small className="file-rel-dir">{dirLabel}</small>}
+                  </span>
+                  <GitStatusBadge code={entry.gitStatus} />
                   <button
                     type="button"
-                    className="preview-action-btn"
-                    onClick={() => void window.hive.openPath(preview.path, roomId)}
-                    title="用系统默认应用打开"
+                    className="file-ref-btn"
+                    title="引用路径到输入框"
+                    onClick={e => {
+                      e.stopPropagation()
+                      onInsertPath(entry.relPath)
+                    }}
                   >
-                    <ExternalLink size={13} /> 打开
+                    <MessageSquarePlus size={12} />
                   </button>
-                  <Dialog.Close>
-                    <IconButton variant="ghost" color="gray" aria-label="关闭预览"><X size={16} /></IconButton>
-                  </Dialog.Close>
                 </div>
-              </div>
-
-              <ScrollArea className="preview-body" insetTop={6} insetBottom={6}>
-                {preview.kind === 'image' && (
-                  <div className="preview-img-wrap">
-                    <img src={preview.dataUrl} alt={preview.name} />
-                  </div>
-                )}
-                {preview.kind === 'pdf' && (
-                  <iframe className="preview-pdf" src={preview.dataUrl} title={preview.name} />
-                )}
-                {preview.kind === 'markdown' && (
-                  <div className="preview-md">
-                    <MarkdownView content={preview.content} roomId={roomId} />
-                  </div>
-                )}
-                {preview.kind === 'text' && (
-                  <pre className="preview-code"><code>{preview.content}</code></pre>
-                )}
-                {preview.kind === 'binary' && (
-                  <div className="preview-binary">
-                    <p>{preview.note || '此文件格式暂不支持内置预览，可点击右上角用系统应用打开。'}</p>
-                  </div>
-                )}
-              </ScrollArea>
-            </>
-          )}
-        </Dialog.Content>
-      </Dialog.Root>
+              )
+            })
+          ) : (
+            <div className="file-empty">工作区无未提交变更</div>
+          )
+        ) : (
+          <>
+            {renderNodes('', 0)}
+            {!loading && !(childrenMap['']?.length) && (
+              <div className="file-empty">目录为空</div>
+            )}
+          </>
+        )}
+      </ScrollArea>
     </aside>
   )
 }

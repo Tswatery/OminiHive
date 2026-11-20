@@ -10,6 +10,7 @@
   --bg-main: #ffffff;
   --bg-elevated: #ffffff;
   --bg-subtle: #f5f4f0;
+  --preview-checker: rgba(15, 23, 42, 0.035);
   --bg-hover: rgba(15, 23, 42, 0.055);
   --bg-active: rgba(184, 130, 28, 0.11);
   --bg-code: #f6f8fa;
@@ -64,6 +65,10 @@
   --radius-sm: 6px;
   --radius-md: 10px;
   --radius-lg: 16px;
+
+  /* Chat Column Layout */
+  --chat-max-width: 760px;
+  --chat-gutter: 24px;
 }
 
 :root[data-theme="dark"] {
@@ -72,6 +77,7 @@
   --bg-main: #1b1d22;
   --bg-elevated: #24272e;
   --bg-subtle: #22252c;
+  --preview-checker: rgba(255, 255, 255, 0.04);
   --bg-hover: rgba(255, 255, 255, 0.065);
   --bg-active: rgba(227, 167, 47, 0.14);
   --bg-code: #121418;

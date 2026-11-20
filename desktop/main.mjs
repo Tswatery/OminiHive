@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, nativeTheme, session, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, nativeTheme, net, protocol, session, shell } from 'electron'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
@@ -7,21 +7,54 @@ import path from 'node:path'
 import { createQuotaClient } from './volc-quota.mjs'
 import { createCatalog } from './catalog.mjs'
 import { Store, routeTargets } from './store.mjs'
-import { execute, availability, respondAgentInteraction } from './agents.mjs'
-import { respondDesktopInteraction, focusDesktopApp } from './antigravity-desktop.mjs'
+import { execute, availability, respondAgentInteraction, killAllAgentProcesses } from './agents.mjs'
+import { respondDesktopInteraction, focusDesktopApp, cancelDesktopBackground } from './antigravity-desktop.mjs'
 import { initClients, inventory, updates, upgrade, isUpgrading } from './clients.mjs'
 import { ccSwitchSummary } from './ccswitch.mjs'
-import { listFiles, previewFile, listAgentSkills } from './workspace.mjs'
+import { listFiles, previewFile, listAgentSkills, resolveLocalFilePath, getGitStatus, opensAsProgram } from './workspace.mjs'
 import { syncRoomExternal, listExternalSessions, loadExternalSessionTurns } from './sync.mjs'
 
 app.setName('OminiHive')
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'ominihive-preview', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } }
+])
 const root = fileURLToPath(new URL('../', import.meta.url))
 const page = path.join(root, 'dist/index.html')
 let win, store, timer, activeRoomId = ''
 const jobs = new Map()
 const bgRunning = new Map()
+// Messages the user explicitly stopped: late events from a background watcher must not revive them.
+const stoppedMsgIds = new Set()
+// room:agent -> in-flight desktop cancellation, so an "interrupt and send" waits for it.
+const bgCancels = new Map()
+
+function stopBackground(key) {
+  const bg = bgRunning.get(key)
+  if (!bg) return null
+  bgRunning.delete(key)
+  stoppedMsgIds.add(bg.msgId)
+  if (stoppedMsgIds.size > 200) stoppedMsgIds.delete(stoppedMsgIds.values().next().value)
+  store.finish(bg.msgId, '已停止')
+  if (!bg.cascadeId) return null
+  const p = cancelDesktopBackground(bg.cascadeId).catch(() => false).finally(() => {
+    if (bgCancels.get(key) === p) bgCancels.delete(key)
+  })
+  bgCancels.set(key, p)
+  return p
+}
 const syncInflight = new Map()
 const lastSyncAt = new Map()
+const previewTokens = new Map()
+
+function issuePreviewUrl(filePath) {
+  const token = randomUUID()
+  previewTokens.set(token, filePath)
+  if (previewTokens.size > 64) {
+    const first = previewTokens.keys().next().value
+    if (first) previewTokens.delete(first)
+  }
+  return `ominihive-preview://file/${token}.pdf`
+}
 
 function allRunning() {
   const map = new Map()
@@ -112,9 +145,23 @@ async function run(room, text, allowWrite, modelOrPrefs = '', effort = '', targe
     const m = prefs ? (prefs[agent]?.model || '') : modelOrPrefs
     if (typeof m !== 'string' || m.length > 200) throw Error('无效的模型')
   }
-
-  await syncRoom(room, { force: true }).catch(() => 0)
-  const savedImages = saveAttachments(images)
+  // Reserve every target synchronously, before the first await, so a second send
+  // arriving while we sync/prepare cannot start a duplicate run of the same agent.
+  const reserved = new Map()
+  for (const agent of agents) {
+    const entry = { room, agent, controller: new AbortController() }
+    jobs.set(room + ':' + agent, entry)
+    reserved.set(agent, entry)
+  }
+  changed()
+  let runs
+  let savedImages
+  try {
+    await syncRoom(room, { force: true }).catch(() => 0)
+    // Interrupting a background Antigravity turn: cancel it in the desktop app first,
+    // otherwise the new turn is rejected because the session is still running.
+    await Promise.all(agents.map(agent => stopBackground(room + ':' + agent) || bgCancels.get(room + ':' + agent)))
+    savedImages = saveAttachments(images)
   const sessionKeys = {}
   const freshAgents = new Set()
   for (const agent of agents) {
@@ -136,16 +183,19 @@ async function run(room, text, allowWrite, modelOrPrefs = '', effort = '', targe
     }
     if (prefs?.[agent]?.fresh) freshAgents.add(agent)
   }
-  const runs = store.startBatch(room, text, targetAgents, agents, savedImages, sessionKeys, freshAgents)
+    runs = store.startBatch(room, text, targetAgents, agents, savedImages, sessionKeys, freshAgents)
+  } catch (e) {
+    for (const [agent, entry] of reserved) {
+      if (jobs.get(room + ':' + agent) === entry) jobs.delete(room + ':' + agent)
+    }
+    changed()
+    throw e
+  }
   await Promise.all(runs.map(async item => {
     const key = room + ':' + item.agent
-    const prevBg = bgRunning.get(key)
-    if (prevBg) {
-      bgRunning.delete(key)
-      store.finish(prevBg.msgId, '完成')
-    }
-    const controller = new AbortController()
-    jobs.set(key, { room, agent: item.agent, controller })
+    const job = reserved.get(item.agent)
+    const controller = job.controller
+    let cascadeId = item.agent === 'Antigravity' ? (item.session || '') : ''
     changed()
     const m = prefs ? (prefs[item.agent]?.model || '') : modelOrPrefs
     const ef = prefs ? (prefs[item.agent]?.effort || '') : effort
@@ -166,9 +216,11 @@ async function run(room, text, allowWrite, modelOrPrefs = '', effort = '', targe
         access,
         signal: controller.signal,
         emit(type, value) {
+          if (stoppedMsgIds.has(item.id)) return
+          if (type === 'session' && item.agent === 'Antigravity') cascadeId = String(value || '')
           if (type === 'status') {
             if (value === '执行中') {
-              bgRunning.set(key, { room, agent: item.agent, msgId: item.id })
+              bgRunning.set(key, { room, agent: item.agent, msgId: item.id, cascadeId })
               store.setStatus(item.id, '执行中')
             } else {
               if (bgRunning.get(key)?.msgId === item.id) bgRunning.delete(key)
@@ -181,7 +233,7 @@ async function run(room, text, allowWrite, modelOrPrefs = '', effort = '', targe
           changed()
         }
       })
-      if (bgRunning.get(key)?.msgId !== item.id) {
+      if (bgRunning.get(key)?.msgId !== item.id && !stoppedMsgIds.has(item.id)) {
         store.finish(item.id, '完成')
       }
       store.markSeen(room, item.sessionKey, item.seenRowid)
@@ -193,7 +245,7 @@ async function run(room, text, allowWrite, modelOrPrefs = '', effort = '', targe
       store.record(item.id, room, item.agent, 'log', e.message)
       store.finish(item.id, controller.signal.aborted ? '已停止' : '失败')
     } finally {
-      jobs.delete(key)
+      if (jobs.get(key) === job) jobs.delete(key)
       changed()
     }
   }))
@@ -226,6 +278,17 @@ function openWindow() {
 
 if (!app.requestSingleInstanceLock()) app.quit()
 else app.whenReady().then(async () => {
+  protocol.handle('ominihive-preview', req => {
+    try {
+      const u = new URL(req.url)
+      const token = decodeURIComponent(u.pathname.replace(/^\/+/, '')).replace(/\.pdf$/i, '')
+      const filePath = previewTokens.get(token)
+      if (!filePath || !existsSync(filePath)) return new Response('Not Found', { status: 404 })
+      return net.fetch(pathToFileURL(filePath).href)
+    } catch {
+      return new Response('Bad Request', { status: 400 })
+    }
+  })
   await initClients()
   store = new Store(path.join(app.getPath('userData'), 'workspace.sqlite'))
   session.defaultSession.setPermissionRequestHandler((_wc, _perm, cb) => cb(false))
@@ -235,6 +298,13 @@ else app.whenReady().then(async () => {
     running: allRunning()
   }))
   handle('messages', room => { activeRoomId = room; void syncRoom(room); return store.messages(room) })
+  // Streaming refreshes: only changed rows. External-client sync runs on the first load
+  // of a room (empty `known`) and on the renderer's periodic syncRoom, not on every delta.
+  handle('messagesDelta', (room, known) => {
+    const first = !known || !Object.keys(known).length
+    if (first || activeRoomId !== room) { activeRoomId = room; void syncRoom(room) }
+    return store.messagesDelta(room, known && typeof known === 'object' ? known : {})
+  })
   handle('syncRoom', room => syncRoom(room, { force: true }))
   handle('add', async () => {
     const r = await dialog.showOpenDialog(win, { title: '选择本地项目', properties: ['openDirectory'] })
@@ -274,10 +344,18 @@ else app.whenReady().then(async () => {
     const row = store.get('SELECT p.dir FROM projects p JOIN rooms r ON p.id=r.project WHERE r.id=?', roomId)
     return row ? listFiles(row.dir, relDir) : []
   })
-  handle('previewFile', (roomId, filePath) => {
+  handle('gitStatus', roomId => {
     const row = store.get('SELECT p.dir FROM projects p JOIN rooms r ON p.id=r.project WHERE r.id=?', roomId)
-    if (!row) throw Error('未找到对应项目目录')
-    return previewFile(row.dir, filePath)
+    return row ? getGitStatus(row.dir) : { isRepo: false, branch: '', files: {}, dirs: {}, changes: [] }
+  })
+  handle('previewFile', async (roomId, filePath) => {
+    const row = roomId ? store.get('SELECT p.dir FROM projects p JOIN rooms r ON p.id=r.project WHERE r.id=?', roomId) : null
+    const res = await previewFile(row?.dir || '', filePath)
+    if (res && res.kind === 'pdf' && res.pdfFilePath) {
+      const { pdfFilePath, ...rest } = res
+      return { ...rest, dataUrl: issuePreviewUrl(pdfFilePath) }
+    }
+    return res
   })
   handle('agentSkills', roomId => {
     const row = roomId ? store.get('SELECT p.dir FROM projects p JOIN rooms r ON p.id=r.project WHERE r.id=?', roomId) : null
@@ -297,16 +375,15 @@ else app.whenReady().then(async () => {
     if (agent) {
       const k = room + ':' + agent
       jobs.get(k)?.controller.abort()
-      const bg = bgRunning.get(k)
-      if (bg) { bgRunning.delete(k); store.finish(bg.msgId, '已停止'); changed() }
+      if (bgRunning.has(k)) { void stopBackground(k); changed() }
       return
     }
     for (const [k, job] of jobs.entries()) {
       if (job.room === room) job.controller.abort()
     }
     let bgCleared = false
-    for (const [k, bg] of bgRunning.entries()) {
-      if (bg.room === room) { bgRunning.delete(k); store.finish(bg.msgId, '已停止'); bgCleared = true }
+    for (const [k, bg] of [...bgRunning.entries()]) {
+      if (bg.room === room) { void stopBackground(k); bgCleared = true }
     }
     if (bgCleared) changed()
   })
@@ -316,15 +393,20 @@ else app.whenReady().then(async () => {
     await shell.openExternal(parsed.href)
   })
   handle('openPath', async (targetPath, roomId) => {
-    let resolved = String(targetPath || '').trim()
-    if (!resolved) return false
-    if (!path.isAbsolute(resolved) && roomId) {
-      const row = store.get('SELECT p.dir FROM projects p JOIN rooms r ON p.id=r.project WHERE r.id=?', roomId)
-      if (row) resolved = path.resolve(row.dir, resolved)
-    }
-    if (!existsSync(resolved)) return false
+    const row = roomId ? store.get('SELECT p.dir FROM projects p JOIN rooms r ON p.id=r.project WHERE r.id=?', roomId) : null
+    const resolved = resolveLocalFilePath(row?.dir || '', targetPath)
+    if (!resolved || !existsSync(resolved)) return false
+    // A click on a link in agent output must never launch an app or script; reveal it instead.
+    if (opensAsProgram(resolved)) { shell.showItemInFolder(resolved); return true }
     const err = await shell.openPath(resolved)
     if (err) shell.showItemInFolder(resolved)
+    return true
+  })
+  handle('revealPath', (targetPath, roomId) => {
+    const row = roomId ? store.get('SELECT p.dir FROM projects p JOIN rooms r ON p.id=r.project WHERE r.id=?', roomId) : null
+    const resolved = resolveLocalFilePath(row?.dir || '', targetPath)
+    if (!resolved || !existsSync(resolved)) return false
+    shell.showItemInFolder(resolved)
     return true
   })
   handle('respondInteraction', req => {
@@ -343,5 +425,8 @@ else app.whenReady().then(async () => {
 })
 
 app.on('second-instance', () => win?.focus())
-app.on('before-quit', () => { for (const job of jobs.values()) job.controller.abort() })
+app.on('before-quit', () => {
+  for (const job of jobs.values()) job.controller.abort()
+  killAllAgentProcesses()
+})
 app.on('window-all-closed', () => app.quit())

@@ -314,6 +314,30 @@ export function stopWatchingDesktopCallbacks(cascadeId) {
   }
 }
 
+/**
+ * Stop a background (callback-watched) desktop turn: drop the watcher so no more events
+ * are emitted, cancel the cascade in the desktop app, then wait briefly for it to go idle
+ * so an immediate follow-up turn is not rejected as "still running".
+ */
+export async function cancelDesktopBackground(cascadeId) {
+  if (!cascadeId) return false
+  const w = callbackWatchers.get(cascadeId)
+  const active = activeDesktopRpcs.get(cascadeId)
+  stopWatchingDesktopCallbacks(cascadeId)
+  activeDesktopRpcs.delete(cascadeId)
+  const app = w?.app || active?.app || desktopApp()
+  const rpc = w?.rpc || active?.rpc || (app ? await findDesktop(app) : null)
+  if (!rpc) return false
+  await rpc('CancelCascadeInvocation', {cascadeId}).catch(() => {})
+  for (let i = 0; i < 12; i++) {
+    const meta = await rpc('GetAllCascadeTrajectories', {excludeSubtrajectories:true}).catch(() => null)
+    const s = meta?.trajectorySummaries?.[cascadeId]
+    if (!s || !((s.status && !s.status.endsWith('_IDLE')) || s.notFullyIdle)) return true
+    await new Promise(resolve => setTimeout(resolve, 500))
+  }
+  return false
+}
+
 // The CLI publishes descriptors here too. Only use a listener owned by the installed desktop executable.
 async function findDesktop(app) {
   const expected = path.join(app, 'Contents/Resources/bin/language_server')

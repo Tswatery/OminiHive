@@ -9,6 +9,8 @@ export type QueuedMessage<A extends string = string> = {
   /** resolved agent names (expands 'all'), used for busy checks and prefs */
   targetList: A[]
   images: { name: string; dataUrl: string }[]
+  /** set when auto-dispatch failed; the room's queue pauses until the user retries or withdraws */
+  error?: string
 }
 
 export type QueueState<A extends string = string> = Record<string, QueuedMessage<A>[]>
@@ -28,10 +30,17 @@ export function appendItem<A extends string>(state: QueueState<A>, item: QueuedM
   return setRoom(state, item.room, [...(state[item.room] || []), item])
 }
 
-/** Put the item at the head of its room queue (moving it if already queued). */
+/** Put the item at the head of its room queue (moving it if already queued). Clears a previous failure. */
 export function prioritizeItem<A extends string>(state: QueueState<A>, item: QueuedMessage<A>): QueueState<A> {
   const rest = (state[item.room] || []).filter(x => x.id !== item.id)
-  return setRoom(state, item.room, [item, ...rest])
+  const { error: _error, ...fresh } = item
+  return setRoom(state, item.room, [fresh as QueuedMessage<A>, ...rest])
+}
+
+/** Put a failed dispatch back at the head of its room, keeping its text, with the error attached. */
+export function restoreFailed<A extends string>(state: QueueState<A>, item: QueuedMessage<A>, error: string): QueueState<A> {
+  const rest = (state[item.room] || []).filter(x => x.id !== item.id)
+  return setRoom(state, item.room, [{ ...item, error: error || '发送失败' }, ...rest])
 }
 
 /** Remove one item; drops the room key when its queue becomes empty. */
@@ -50,7 +59,7 @@ export function drainableHeads<A extends string>(state: QueueState<A>, running: 
   const heads: QueuedMessage<A>[] = []
   for (const [room, list] of Object.entries(state)) {
     const head = list[0]
-    if (!head || skipRooms.has(room)) continue
+    if (!head || head.error || skipRooms.has(room)) continue
     if (head.targetList.some(a => busy.has(room + '\u0000' + a))) continue
     heads.push(head)
   }

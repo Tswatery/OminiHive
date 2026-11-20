@@ -368,7 +368,76 @@ export class QwenStreamAdapter extends AgentStepTracker {
 }
 
 /**
- * Generic adapter for simple CLIs (DeepSeek, Hermes, MiniMax, Grok, OpenClaw):
+ * Adapter for DeepSeek Harness (`dsh headless --json ...`).
+ * Parses newline-delimited events emitted by `@deepseek-ai/dsh-headless`:
+ * session, status, thinking, text, tool_call, tool_result, final, error.
+ */
+export class DeepSeekStreamAdapter extends AgentStepTracker {
+  constructor(opts) {
+    super({ ...opts, prefix: 'deepseek' })
+  }
+
+  handleLine(line) {
+    if (!line || !line.trim()) return
+    const trimmed = line.trim()
+    if (!trimmed.startsWith('{')) {
+      this.emitText(line + '\n')
+      return
+    }
+    let e
+    try { e = JSON.parse(trimmed) } catch {
+      this.emitText(line + '\n')
+      return
+    }
+    if (e.type === 'session') {
+      if (e.sessionId) this.emit('session', e.sessionId)
+      return
+    }
+    if (e.type === 'status') {
+      if (e.phase === 'turn_end' && e.reason?.kind === 'error' && e.reason?.error?.message) {
+        this.fail(Error(e.reason.error.message))
+      }
+      return
+    }
+    if (e.type === 'thinking') {
+      if (typeof e.text === 'string' && e.text.trim()) this.finishThinking(e.text)
+      return
+    }
+    if (e.type === 'text') {
+      if (typeof e.text === 'string') this.emitText(e.text)
+      return
+    }
+    if (e.type === 'tool_call') {
+      this.startTool(e.callId || e.id, e.tool || e.name, e.input ?? e.arguments)
+      return
+    }
+    if (e.type === 'tool_result') {
+      const errMsg = typeof e.error === 'string' ? e.error : e.error?.message
+      this.finishTool(e.callId || e.id, {
+        name: e.tool || e.name,
+        output: e.result ?? e.output ?? errMsg ?? '',
+        isError: Boolean(e.status === 'error' || e.is_error || e.error)
+      })
+      return
+    }
+    if (e.type === 'final') {
+      if (e.sessionId) this.emit('session', e.sessionId)
+      if (!this.hasTextOutput && typeof e.text === 'string' && e.text) {
+        this.emitText(e.text)
+      }
+      if (e.reason?.kind === 'error' && e.reason?.error?.message) {
+        this.fail(Error(e.reason.error.message))
+      }
+      return
+    }
+    if (e.type === 'error') {
+      this.fail(Error(e.message || 'DeepSeek Harness 执行失败'))
+    }
+  }
+}
+
+/**
+ * Generic adapter for simple CLIs (Hermes, MiniMax, Grok, OpenClaw):
  * parses structured JSONL events if emitted, otherwise streams plain text + stderr progress.
  */
 export class SimpleCliAdapter extends AgentStepTracker {
@@ -415,5 +484,6 @@ export function createStepAdapter(agent, opts) {
   if (agent === 'OhMyPi' || agent === 'Pi') return new PiStreamAdapter({ ...opts, prefix: agent.toLowerCase() })
   if (agent === 'OpenCode') return new OpenCodeStreamAdapter(opts)
   if (agent === 'Qwen') return new QwenStreamAdapter(opts)
+  if (agent === 'DeepSeek') return new DeepSeekStreamAdapter(opts)
   return new SimpleCliAdapter({ ...opts, prefix: String(agent || 'cli').toLowerCase() })
 }

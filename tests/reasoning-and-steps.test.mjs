@@ -8,6 +8,7 @@ import {
   parseEffortsFromHelp
 } from '../desktop/reasoning.mjs'
 import { createStepAdapter } from '../desktop/step-tracker.mjs'
+import { buildDeepSeekArgs } from '../desktop/agents.mjs'
 
 test('all registered agents receive unified reasoning effort levels', () => {
   for (const agent of Object.keys(names)) {
@@ -71,4 +72,69 @@ test('PiStreamAdapter extracts thinking, tool execution steps, and text for OhMy
   assert.ok(steps.some(s => s.kind === 'thought' && s.status === 'done' && s.detail.includes('先检查项目结构')))
   assert.ok(steps.some(s => s.kind === 'tool' && s.id === 'tc-1' && s.status === 'running' && s.title.includes('ls -la')))
   assert.ok(steps.some(s => s.kind === 'tool' && s.id === 'tc-1' && s.status === 'done' && s.detail.includes('package.json')))
+})
+
+test('buildDeepSeekArgs uses dsh headless profile with valid flags and no --model', () => {
+  const argsFull = buildDeepSeekArgs({ prompt: 'hello', accessMode: 'full', write: true, session: 'session-123', patchFile: '/tmp/p.yml' })
+  assert.deepEqual(argsFull, [
+    'headless',
+    '--patch', '/tmp/p.yml',
+    '--json',
+    '--permission-mode', 'danger-full-access',
+    '--session-id', 'session-123',
+    '--', 'hello'
+  ])
+  assert.ok(!argsFull.includes('run'))
+  assert.ok(!argsFull.includes('--model'))
+
+  const argsRead = buildDeepSeekArgs({ prompt: '- check', accessMode: 'read', write: false })
+  assert.deepEqual(argsRead, [
+    'headless',
+    '--json',
+    '--permission-mode', 'read-only',
+    '--approval-policy', 'never',
+    '--', '- check'
+  ])
+
+  const argsWrite = buildDeepSeekArgs({ prompt: 'fix bug', accessMode: 'workspace', write: true })
+  assert.deepEqual(argsWrite, [
+    'headless',
+    '--json',
+    '--permission-mode', 'workspace-write',
+    '--approval-policy', 'never',
+    '--', 'fix bug'
+  ])
+})
+
+test('DeepSeekStreamAdapter parses dsh headless --json events without duplicating final text', () => {
+  const steps = []
+  const sessions = []
+  let output = ''
+  const errors = []
+  const adapter = createStepAdapter('DeepSeek', {
+    emit: (type, value) => {
+      if (type === 'session') sessions.push(value)
+      if (type === 'log' && String(value).startsWith('::step::')) {
+        steps.push(JSON.parse(String(value).slice(8)))
+      }
+    },
+    append: s => { output += s },
+    fail: err => { errors.push(err) }
+  })
+
+  adapter.handleLine(JSON.stringify({ type: 'session', sessionId: 'session-abc', cwd: '/tmp' }))
+  adapter.handleLine(JSON.stringify({ type: 'status', phase: 'turn_start', turn: 1 }))
+  adapter.handleLine(JSON.stringify({ type: 'thinking', text: '先分析需求' }))
+  adapter.handleLine(JSON.stringify({ type: 'tool_call', callId: 'call-1', tool: 'bash', input: { command: 'pwd' } }))
+  adapter.handleLine(JSON.stringify({ type: 'tool_result', callId: 'call-1', status: 'completed', result: '/tmp' }))
+  adapter.handleLine(JSON.stringify({ type: 'text', text: '已完成检查。' }))
+  adapter.handleLine(JSON.stringify({ type: 'final', sessionId: 'session-abc', reason: { kind: 'completed' }, text: '已完成检查。' }))
+  adapter.finalize()
+
+  assert.deepEqual(sessions, ['session-abc', 'session-abc'])
+  assert.equal(output, '已完成检查。')
+  assert.equal(errors.length, 0)
+  assert.ok(steps.some(s => s.kind === 'thought' && s.status === 'done' && s.detail.includes('先分析需求')))
+  assert.ok(steps.some(s => s.kind === 'tool' && s.id === 'call-1' && s.status === 'running' && s.title.includes('pwd')))
+  assert.ok(steps.some(s => s.kind === 'tool' && s.id === 'call-1' && s.status === 'done' && s.detail.includes('/tmp')))
 })

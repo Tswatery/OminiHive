@@ -25,16 +25,19 @@ export function SendQueueBar<A extends string>({
         {items.map(q => (
           <div key={q.id} className="queue-item">
             <span className="queue-item-target">{q.targets === 'all' ? '@all' : q.targetList.join('、')}</span>
-            <span className="queue-item-text" title={q.raw}>{q.raw}</span>
+            <span className="queue-item-text" title={q.error ? q.error : q.raw}>
+              {q.error && <span className="queue-item-error">发送失败</span>}
+              {q.raw}
+            </span>
             <div className="queue-item-actions">
               <button
                 type="button"
                 className="queue-item-now"
-                title="立即打断当前运行并发送此消息"
+                title={q.error ? '重新发送：' + q.error : '立即打断当前运行并发送此消息'}
                 onClick={() => onSendNow(q)}
               >
                 <Zap size={11} />
-                <span>打断发</span>
+                <span>{q.error ? '重试' : '打断发'}</span>
               </button>
               <button
                 type="button"

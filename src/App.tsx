@@ -2,22 +2,25 @@ import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { createRoot } from 'react-dom/client'
 import {
   Folder, FolderPlus, FolderOpen, MessageSquare, Plus, ArrowUp, Square,
-  Shield, ShieldAlert, Hexagon, Terminal, PanelLeft, Compass, Copy, Check,
-  RotateCcw, RefreshCw, Sparkles, ChevronRight, ChevronDown, ChevronUp, X, Forward, Users, FileText, FolderTree, UserPlus, ExternalLink, Sun, Moon, Pencil, Download
+  PanelLeft, Compass, Copy, Check,
+  RotateCcw, Sparkles, ChevronRight, ChevronDown, ChevronUp, X, Forward, Users, FileText, UserPlus, ExternalLink, Sun, Moon, Pencil, Eye, FolderSearch
 } from 'lucide-react'
-import { Theme, Button, DropdownMenu } from '@radix-ui/themes'
+import { Theme, Button } from '@radix-ui/themes'
 import '@radix-ui/themes/styles.css'
 import { DeleteButton } from './Controls'
 import { ModelEffortPicker, Settings, type ModelOption, type ClientInfo, type CCSwitchSummary } from './Preferences'
 import { AgentIcon } from './AgentIcon'
 import { RoomMembersPicker, TargetSelector } from './RoomMembers'
-import { ALL_AGENTS, CORE_AGENTS, AGENT_CLASS, agentLabel, agentShort, agentMatchesQuery, type Agent } from './agentMeta'
+import { ALL_AGENTS, CORE_AGENTS, AGENT_CLASS, agentColor, finishedAgentsByRoom, runKey, agentShort, agentMatchesQuery, type Agent } from './agentMeta'
 import { MarkdownView } from './MarkdownView'
+import { buildMentionTools } from './mentions'
 import type { QuotaResult } from './VolcQuota'
-import { FileDrawer, type FileEntry, type PreviewResult } from './FileDrawer'
+import { FileDrawer, type FileEntry, type GitStatusResult, type PreviewResult } from './FileDrawer'
+import { FilePreviewPanel } from './FilePreviewPanel'
+import { ImageLightbox, loadLocalImage, type LightboxImageItem } from './ImageLightbox'
 import { ImportSessionModal, type ExternalSessionItem } from './ImportSessionModal'
 import { OverlayScrollbar, ScrollArea } from './OverlayScrollbar'
-import { ExecutionTimeline, formatDuration, parseStepsWithMeta } from './ExecutionTimeline'
+import { ExecutionTimeline, InlineStepGroup, ProjectDirContext, buildTimelineSegments, formatDuration, parseStepsWithMeta } from './ExecutionTimeline'
 import { ChatHeader } from './ChatHeader'
 import { ComposerToolbar, type AccessMode } from './ComposerToolbar'
 import { cleanError } from './errors'
@@ -41,6 +44,7 @@ declare global {
     hive: {
       tree(): Promise<Tree>
       messages(id: string): Promise<Msg[]>
+      messagesDelta(id: string, known: Record<string, string>): Promise<{ ids: string[]; rows: (Msg & { sig: string })[] }>
       syncRoom(id: string): Promise<number>
       add(): Promise<string | null>
       room(id: string): Promise<string>
@@ -53,6 +57,7 @@ declare global {
       clients(): Promise<ClientInfo[]>
       ccSwitch(): Promise<CCSwitchSummary>
       files(roomId: string, relDir?: string): Promise<FileEntry[]>
+      gitStatus(roomId: string): Promise<GitStatusResult>
       previewFile(roomId: string, filePath: string): Promise<PreviewResult>
       agentSkills(roomId?: string): Promise<Record<Agent, SkillEntry[]>>
       updates(): Promise<ClientInfo[]>
@@ -65,6 +70,7 @@ declare global {
       stop(id: string, agent?: Agent): Promise<void>
       openExternal(url: string): Promise<void>
       openPath(filePath: string, roomId?: string): Promise<boolean>
+      revealPath(filePath: string, roomId?: string): Promise<boolean>
       respondInteraction(req: { cascadeId: string; trajectoryId?: string; stepIndex: number; payload: Record<string, unknown> }): Promise<boolean>
       focusAntigravity(): Promise<boolean>
       setTheme(mode: 'light' | 'dark' | 'system'): Promise<boolean>
@@ -77,10 +83,9 @@ const api = window.hive
 const allAgents: Agent[] = ALL_AGENTS
 const coreAgents: Agent[] = CORE_AGENTS
 const agentClass: Record<Agent, string> = AGENT_CLASS
-const AGENT_REGEX_PART = ALL_AGENTS.join('|')
-const MENTION_MATCH_RE = new RegExp(`(?:^|\\s)@(${AGENT_REGEX_PART}|all)(?=\\s|$|[，。,.!?！？])`, 'gi')
-const MENTION_SPLIT_RE = new RegExp(`(@(?:${AGENT_REGEX_PART}|all)\\b)`, 'gi')
-const LEADING_MENTIONS_RE = new RegExp(`^(?:@(?:${AGENT_REGEX_PART}|all)\\s+)+`, 'i')
+/** Each agent's own accent (non-core agents used to borrow one of three core colors). */
+const agentTint = (a: string) => ({ '--agent-color': agentColor(a) } as React.CSSProperties)
+const { MENTION_SPLIT_RE, LEADING_MENTIONS_RE, parseMentionedAgents } = buildMentionTools<Agent>(ALL_AGENTS)
 
 const STARTER_PROMPTS = [
   { title: '梳理项目结构', desc: '快速理解目录职责与核心模块', text: '帮我梳理这个项目的目录结构、核心入口和主要模块职责。' },
@@ -91,20 +96,29 @@ const STARTER_PROMPTS = [
 
 
 
-function parseMentionedAgents(text: string, allPool: Agent[] = allAgents): { agents: Agent[]; isAll: boolean } {
-  const found: Agent[] = []
-  let isAll = false
-  for (const m of text.matchAll(MENTION_MATCH_RE)) {
-    if (m[1].toLowerCase() === 'all') {
-      isAll = true
-      for (const a of allPool) if (!found.includes(a)) found.push(a)
-    } else {
-      const norm = allAgents.find(a => a.toLowerCase() === m[1].toLowerCase())
-      if (norm && !found.includes(norm)) found.push(norm)
-    }
-  }
-  return { agents: found, isAll }
+/** Sidebar status: breathing dots for running agents, solid agent-colored dots for finished ones. */
+function AgentStatusDots({ running, done, justDone, scope = '' }: { running: string[]; done: string[]; justDone: string[]; scope?: string }) {
+  const runningSet = new Set(running)
+  const finished = done.filter(a => !runningSet.has(a))
+  if (!running.length && !finished.length) return null
+  const title = [
+    ...running.map(a => `${agentShort(a)} 执行中`),
+    ...finished.map(a => `${agentShort(a)} 已完成`)
+  ].join('、')
+  return (
+    <span className="room-dots" title={scope ? `${scope}：${title}` : title}>
+      {running.map(a => <i key={'r-' + a} className="dot" style={{ '--agent-dot': agentColor(a) } as React.CSSProperties} />)}
+      {finished.map(a => (
+        <span
+          key={'d-' + a}
+          className={'done-dot' + (justDone.includes(a) ? ' pulse' : '')}
+          style={{ '--agent-dot': agentColor(a) } as React.CSSProperties}
+        />
+      ))}
+    </span>
+  )
 }
+
 
 function scoreSlashOption(searchTitle: string, searchDesc: string, rawQuery: string): number {
   const q = rawQuery.trim().toLowerCase()
@@ -247,85 +261,151 @@ function parseUserBody(raw: string): { display: string; assembledContext: string
   return { display: text, assembledContext: null }
 }
 
-const UserBubble = React.memo(function UserBubble({ body, attachments, log }: { body: string; attachments?: string; log?: string }) {
+const IMAGE_PATH_RE = /\.(png|jpe?g|gif|webp|bmp|svg)$/i
+
+/** Attachment image: uses the inline preview when present, otherwise loads it by path (cached). */
+function BubbleImage({ path, dataUrl, alt, onClick, onContextMenu }: {
+  path: string
+  dataUrl?: string
+  alt: string
+  onClick: () => void
+  onContextMenu: (e: React.MouseEvent) => void
+}) {
+  const [src, setSrc] = useState(dataUrl || '')
+  useEffect(() => {
+    if (dataUrl) { setSrc(dataUrl); return }
+    let alive = true
+    void loadLocalImage(undefined, path).then(res => { if (alive && res) setSrc(res.dataUrl) })
+    return () => { alive = false }
+  }, [path, dataUrl])
+  if (!src) return <span className="bubble-img-skeleton" title={alt} />
+  return <img src={src} alt={alt} title={alt} onClick={onClick} onContextMenu={onContextMenu} />
+}
+
+const UserBubble = React.memo(function UserBubble({
+  body, attachments, log, onPreviewFile, onOpenLightbox, onFileContextMenu
+}: {
+  body: string
+  attachments?: string
+  log?: string
+  onPreviewFile?: (targetPath: string) => void
+  onOpenLightbox?: (items: LightboxImageItem[], index: number) => void
+  onFileContextMenu?: (e: React.MouseEvent, absPath: string, allowPreview?: boolean) => void
+}) {
   const { display, assembledContext } = parseUserBody(body)
+  const copyText = (display.replace(LEADING_MENTIONS_RE, '').trim() || display.trim())
   const isLong = display.length > 320 || display.split('\n').length > 6
   const [expanded, setExpanded] = useState(false)
   const [ctxOpen, setCtxOpen] = useState(false)
+  const [copied, setCopied] = useState(false)
   const parts = display.split(MENTION_SPLIT_RE)
   let atts: { path: string; name: string; dataUrl?: string; mimeType?: string; isImage?: boolean }[] = []
   try { if (attachments) atts = JSON.parse(attachments) } catch {}
   const syncLabel = log && /^同步自\s+.+\s+客户端$/.test(log.trim()) ? log.trim().replace(/\s*客户端$/, '') : ''
+  // The message list ships attachments without inline base64 (see store.slimAttachments);
+  // images are then loaded on demand from their saved path.
+  const isImageAtt = (a: typeof atts[number]) => a.isImage !== false && (Boolean(a.dataUrl) || IMAGE_PATH_RE.test(a.path || ''))
+  const imgAtts: LightboxImageItem[] = atts
+    .filter(isImageAtt)
+    .map(a => ({ path: a.path, name: a.name, dataUrl: a.dataUrl || undefined }))
+
+  function copyBody() {
+    if (!copyText) return
+    void navigator.clipboard.writeText(copyText)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
+  }
 
   return (
     <div className="msg-user-row">
-      <div className="mine">
-        {atts.length > 0 && (
-          <div className="bubble-imgs">
-            {atts.map((att, i) => {
-              const isImg = att.isImage !== false && Boolean(att.dataUrl)
-              return isImg ? (
-                <img
-                  key={i}
-                  src={att.dataUrl}
-                  alt={att.name}
-                  title={att.name + ' · 点击打开'}
-                  onClick={() => void api.openPath(att.path)}
-                />
-              ) : (
-                <button
-                  key={i}
-                  type="button"
-                  className="bubble-file"
-                  title={att.name + ' · 点击打开'}
-                  onClick={() => void api.openPath(att.path)}
-                >
-                  <FileText size={13} />
-                  <span>{att.name}</span>
-                </button>
-              )
+      <div className="msg-user-col">
+        <div className="mine">
+          {atts.length > 0 && (
+            <div className="bubble-imgs">
+              {atts.map((att, i) => {
+                const isImg = isImageAtt(att)
+                return isImg ? (
+                  <BubbleImage
+                    key={i}
+                    path={att.path}
+                    dataUrl={att.dataUrl}
+                    alt={att.name}
+                    onClick={() => {
+                      if (onOpenLightbox && imgAtts.length) {
+                        const imgIdx = Math.max(0, imgAtts.findIndex(x => x.path === att.path))
+                        onOpenLightbox(imgAtts, imgIdx)
+                      } else if (onPreviewFile && att.path) {
+                        onPreviewFile(att.path)
+                      } else {
+                        void api.openPath(att.path)
+                      }
+                    }}
+                    onContextMenu={e => { if (att.path) onFileContextMenu?.(e, att.path, true) }}
+                  />
+                ) : (
+                  <button
+                    key={i}
+                    type="button"
+                    className="bubble-file"
+                    title={att.path || att.name}
+                    onClick={() => (onPreviewFile && att.path ? onPreviewFile(att.path) : void api.openPath(att.path))}
+                    onContextMenu={e => { if (att.path) onFileContextMenu?.(e, att.path, true) }}
+                  >
+                    <FileText size={13} />
+                    <span>{att.name}</span>
+                  </button>
+                )
+              })}
+            </div>
+          )}
+          <div className={'mine-body' + (isLong && !expanded ? ' clamped' : '')}>
+            {parts.map((part, i) => {
+              if (part.toLowerCase() === '@all') {
+                return (
+                  <span key={i} className="mention-chip all">
+                    <Users size={12} />
+                    @all
+                  </span>
+                )
+              }
+              const matched = allAgents.find(a => part.toLowerCase() === '@' + a.toLowerCase())
+              if (matched) {
+                return (
+                  <span key={i} className={'mention-chip agent-tinted ' + agentClass[matched]} style={agentTint(matched)}>
+                    <Icon name={matched} size={13} />
+                    @{matched}
+                  </span>
+                )
+              }
+              return <React.Fragment key={i}>{part}</React.Fragment>
             })}
           </div>
-        )}
-        <div className={'mine-body' + (isLong && !expanded ? ' clamped' : '')}>
-          {parts.map((part, i) => {
-            if (part.toLowerCase() === '@all') {
-              return (
-                <span key={i} className="mention-chip all">
-                  <Users size={12} />
-                  @all
-                </span>
-              )
-            }
-            const matched = allAgents.find(a => part.toLowerCase() === '@' + a.toLowerCase())
-            if (matched) {
-              return (
-                <span key={i} className={'mention-chip ' + agentClass[matched]}>
-                  <Icon name={matched} size={13} />
-                  @{matched}
-                </span>
-              )
-            }
-            return <React.Fragment key={i}>{part}</React.Fragment>
-          })}
+          {(isLong || assembledContext || syncLabel) && (
+            <div className="mine-meta">
+              {isLong && (
+                <button type="button" className="fold-link" onClick={() => setExpanded(e => !e)}>
+                  {expanded ? <><ChevronUp size={12} /> 收起</> : <><ChevronDown size={12} /> 展开全部</>}
+                </button>
+              )}
+              {assembledContext && (
+                <button type="button" className="fold-link" onClick={() => setCtxOpen(o => !o)}>
+                  {ctxOpen ? <><ChevronUp size={12} /> 收起附带上下文</> : <><ChevronDown size={12} /> 查看附带上下文</>}
+                </button>
+              )}
+              {syncLabel && <span className="sync-tag">{syncLabel}</span>}
+            </div>
+          )}
+          {ctxOpen && assembledContext && (
+            <pre className="mine-ctx-pre">{assembledContext}</pre>
+          )}
         </div>
-        {(isLong || assembledContext || syncLabel) && (
-          <div className="mine-meta">
-            {isLong && (
-              <button type="button" className="fold-link" onClick={() => setExpanded(e => !e)}>
-                {expanded ? <><ChevronUp size={12} /> 收起</> : <><ChevronDown size={12} /> 展开全部</>}
-              </button>
-            )}
-            {assembledContext && (
-              <button type="button" className="fold-link" onClick={() => setCtxOpen(o => !o)}>
-                {ctxOpen ? <><ChevronUp size={12} /> 收起附带上下文</> : <><ChevronDown size={12} /> 查看附带上下文</>}
-              </button>
-            )}
-            {syncLabel && <span className="sync-tag">{syncLabel}</span>}
+        {copyText && (
+          <div className={'mine-actions' + (copied ? ' copied' : '')}>
+            <button type="button" className="mine-copy-btn" onClick={copyBody} title="复制文字" aria-label="复制文字">
+              {copied ? <Check size={13} /> : <Copy size={13} />}
+              <span>{copied ? '已复制' : '复制'}</span>
+            </button>
           </div>
-        )}
-        {ctxOpen && assembledContext && (
-          <pre className="mine-ctx-pre">{assembledContext}</pre>
         )}
       </div>
     </div>
@@ -342,15 +422,19 @@ function LiveTimer({ startTime }: { startTime: number }) {
 }
 
 const AgentMessage = React.memo(function AgentMessage({
-  m, roomId, isLatest, onStop, onRetry, onContinue, onForward
+  m, roomId, projectDir, isLatest, onStop, onRetry, onContinue, onForward, onPreviewFile, onOpenLightbox, onFileContextMenu
 }: {
   m: Msg
   roomId: string
+  projectDir?: string
   isLatest?: boolean
   onStop: (agent: Agent) => void
   onRetry: (agent: Agent, msgId: string) => void
   onContinue: (agent: Agent) => void
   onForward: (from: string, to: Agent, body: string) => void
+  onPreviewFile: (targetPath: string) => void
+  onOpenLightbox: (items: LightboxImageItem[], index: number) => void
+  onFileContextMenu: (e: React.MouseEvent, absPath: string, allowPreview?: boolean) => void
 }) {
   const [copied, setCopied] = useState(false)
   const agent = allAgents.find(a => a === m.author)
@@ -367,6 +451,7 @@ const AgentMessage = React.memo(function AgentMessage({
   const steps = parsed.steps
   const metaTags = parsed.metaTags
   const contextDetail = parsed.contextDetail
+  const timelineSegments = syncOnlyLabel ? null : buildTimelineSegments(m.body, steps)
   const [ctxOpen, setCtxOpen] = useState(false)
   const hasWaiting = isRunning && steps.some(s => s.status === 'waiting')
   const isLongReply = !isRunning && Boolean(m.body) && (m.body.length > 1200 || m.body.split('\n').length > 20)
@@ -380,7 +465,7 @@ const AgentMessage = React.memo(function AgentMessage({
   }
 
   return (
-    <article className={'msg-agent ' + cls + (isRunning ? ' running' : '')}>
+    <article className={'msg-agent agent-tinted ' + cls + (isRunning ? ' running' : '')} style={agent ? agentTint(agent) : undefined}>
       <div className="msg-avatar">
         <Icon name={m.author} size={20} />
       </div>
@@ -456,46 +541,115 @@ const AgentMessage = React.memo(function AgentMessage({
           <pre className="msg-ctx-detail">{contextDetail}</pre>
         )}
 
-        <ExecutionTimeline
-          steps={steps}
-          isRunning={isRunning}
-          duration={m.duration}
-          defaultExpanded={m.status === '失败' || !m.body}
-          onRespondInteraction={payload => api.respondInteraction(payload)}
-          onFocusAntigravity={() => api.focusAntigravity()}
-        />
-
-        {m.body ? (
-          <div className={'msg-body-wrap' + (isCollapsed ? ' collapsed' : '')}>
-            <MarkdownView content={m.body} roomId={roomId} />
-            {isLongReply && (
-              <div className={'msg-fold-bar' + (isCollapsed ? ' overlaid' : '')}>
-                <button
-                  type="button"
-                  className="msg-fold-btn"
-                  onClick={() => setReplyExpanded(isCollapsed)}
-                >
-                  {isCollapsed ? <><ChevronDown size={13} /> 展开完整回复</> : <><ChevronUp size={13} /> 收起回复</>}
-                </button>
+        {timelineSegments ? (
+          <>
+            <div className={'msg-body-wrap msg-timeline-interleaved' + (isCollapsed ? ' collapsed' : '')}>
+              {/* one clipping/fade container for all segments, so collapse cuts the message as a whole */}
+              <div className="msg-interleaved-content">
+              {timelineSegments.map((seg, idx) =>
+                seg.type === 'text' ? (
+                  <div key={seg.key} className="timeline-text-seg">
+                    <MarkdownView
+                      content={seg.content}
+                      roomId={roomId}
+                      projectDir={projectDir}
+                      onPreviewFile={onPreviewFile}
+                      onOpenLightbox={onOpenLightbox}
+                      onFileContextMenu={onFileContextMenu}
+                    />
+                  </div>
+                ) : (
+                  <InlineStepGroup
+                    key={seg.key}
+                    steps={seg.steps}
+                    isActiveGroup={isRunning && (idx === timelineSegments.length - 1 || seg.steps.some(s => s.status === 'running' || s.status === 'waiting'))}
+                    defaultExpanded={seg.steps.some(s => s.status === 'error') || (!isRunning && !m.body.trim())}
+                    roomId={roomId}
+                    onRespondInteraction={payload => api.respondInteraction(payload)}
+                    onFocusAntigravity={() => api.focusAntigravity()}
+                    onOpenLightbox={onOpenLightbox}
+                    onFileContextMenu={onFileContextMenu}
+                  />
+                )
+              )}
+              </div>
+              {isLongReply && (
+                <div className={'msg-fold-bar' + (isCollapsed ? ' overlaid' : '')}>
+                  <button
+                    type="button"
+                    className="msg-fold-btn"
+                    onClick={() => setReplyExpanded(isCollapsed)}
+                  >
+                    {isCollapsed ? <><ChevronDown size={13} /> 展开完整回复</> : <><ChevronUp size={13} /> 收起回复</>}
+                  </button>
+                </div>
+              )}
+            </div>
+            {!m.body.trim() && !isRunning && agent && (
+              <div className="incomplete-bar">
+                <span>未返回正文内容</span>
+                <button type="button" onClick={() => onContinue(agent)}><ArrowUp size={12} /> 继续</button>
+                <button type="button" onClick={() => onRetry(agent, m.id)}><RotateCcw size={12} /> 重试</button>
               </div>
             )}
-          </div>
+          </>
         ) : (
-          isRunning ? (
-            <div className="typing-skeleton"><span /><span /><span /></div>
-          ) : agent && (
-            <div className="incomplete-bar">
-              <span>未返回正文内容</span>
-              <button type="button" onClick={() => onContinue(agent)}><ArrowUp size={12} /> 继续</button>
-              <button type="button" onClick={() => onRetry(agent, m.id)}><RotateCcw size={12} /> 重试</button>
-            </div>
-          )
+          <>
+            <ExecutionTimeline
+              steps={steps}
+              isRunning={isRunning}
+              connected={metaTags.some(t => !t.startsWith('上下文 '))}
+              hasBody={Boolean(m.body)}
+              duration={m.duration}
+              defaultExpanded={m.status === '失败' || !m.body}
+              roomId={roomId}
+              onRespondInteraction={payload => api.respondInteraction(payload)}
+              onFocusAntigravity={() => api.focusAntigravity()}
+              onOpenLightbox={onOpenLightbox}
+              onFileContextMenu={onFileContextMenu}
+            />
+
+            {m.body ? (
+              <div className={'msg-body-wrap' + (isCollapsed ? ' collapsed' : '')}>
+                <MarkdownView
+                  content={m.body}
+                  roomId={roomId}
+                  projectDir={projectDir}
+                  onPreviewFile={onPreviewFile}
+                  onOpenLightbox={onOpenLightbox}
+                  onFileContextMenu={onFileContextMenu}
+                />
+                {isLongReply && (
+                  <div className={'msg-fold-bar' + (isCollapsed ? ' overlaid' : '')}>
+                    <button
+                      type="button"
+                      className="msg-fold-btn"
+                      onClick={() => setReplyExpanded(isCollapsed)}
+                    >
+                      {isCollapsed ? <><ChevronDown size={13} /> 展开完整回复</> : <><ChevronUp size={13} /> 收起回复</>}
+                    </button>
+                  </div>
+                )}
+              </div>
+            ) : (
+              isRunning ? (
+                <div className="typing-skeleton"><span /><span /><span /></div>
+              ) : agent && (
+                <div className="incomplete-bar">
+                  <span>未返回正文内容</span>
+                  <button type="button" onClick={() => onContinue(agent)}><ArrowUp size={12} /> 继续</button>
+                  <button type="button" onClick={() => onRetry(agent, m.id)}><RotateCcw size={12} /> 重试</button>
+                </div>
+              )
+            )}
+          </>
         )}
       </div>
     </article>
   )
 }, (prev, next) =>
   prev.roomId === next.roomId &&
+  prev.projectDir === next.projectDir &&
   prev.isLatest === next.isLatest &&
   prev.m.id === next.m.id &&
   prev.m.author === next.m.author &&
@@ -527,7 +681,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
     buildPrefs: buildPrefsFor
   } = useAgentPrefs()
   const [inspected, setInspected] = useState<Agent>(() => defaultTargets[0] || 'Codex')
-  const [images, setImages] = useState<ImageDraft[]>([])
+  const [draftImages, setDraftImages] = useState<Record<string, ImageDraft[]>>({})
   const [dragging, setDragging] = useState(false)
   const [error, setError] = useState('')
   const [collapsed, setCollapsed] = useState(false)
@@ -539,6 +693,13 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
   const [agentSkills, setAgentSkills] = useState<Partial<Record<Agent, SkillEntry[]>>>({})
   const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>({})
   const [showFiles, setShowFiles] = useState<boolean>(() => localStorage.getItem('ominihive:files') === '1')
+  const [previewOpen, setPreviewOpen] = useState(false)
+  const [previewData, setPreviewData] = useState<PreviewResult | null>(null)
+  const [previewLoading, setPreviewLoading] = useState(false)
+  const [previewErr, setPreviewErr] = useState('')
+  const [lightbox, setLightbox] = useState<{ items: LightboxImageItem[]; index: number } | null>(null)
+  const [fileMenu, setFileMenu] = useState<{ x: number; y: number; path: string; allowPreview: boolean } | null>(null)
+  const [copyToast, setCopyToast] = useState('')
   const [enabledAgents, setEnabledAgents] = useState<Record<string, boolean>>(() => loadJson('ominihive:enabled', { Codex: true, Claude: true, Antigravity: true }))
   const [roomMembersMap, setRoomMembersMap] = useState<Record<string, Agent[]>>(() => loadJson('ominihive:room-members', {}))
   const [membersOpen, setMembersOpen] = useState(false)
@@ -622,16 +783,69 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
   const [editTitle, setEditTitle] = useState('')
   const [editingProject, setEditingProject] = useState('')
   const [editProjectName, setEditProjectName] = useState('')
+
+  useEffect(() => {
+    if (!editingProject && !editingRoom) return
+    const onPointerDown = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null
+      if (target?.closest('.rename-input')) return
+      const active = document.activeElement as HTMLElement | null
+      if (active?.classList.contains('rename-input')) active.blur()
+      else {
+        setEditingProject('')
+        setEditingRoom('')
+      }
+    }
+    document.addEventListener('mousedown', onPointerDown, true)
+    return () => document.removeEventListener('mousedown', onPointerDown, true)
+  }, [editingProject, editingRoom])
   const [importOpen, setImportOpen] = useState(false)
-  const [unreadDoneRooms, setUnreadDoneRooms] = useState<Record<string, boolean>>({})
-  const [justDoneRooms, setJustDoneRooms] = useState<Record<string, boolean>>({})
-  const prevRunningRoomsRef = useRef<Set<string>>(new Set())
+  const messagesLoadedRef = useRef(false)
+  const previewSeqRef = useRef(0)
+  // room id -> agents whose run finished there (unread / just finished)
+  const [unreadDoneRooms, setUnreadDoneRooms] = useState<Record<string, string[]>>({})
+  const [justDoneRooms, setJustDoneRooms] = useState<Record<string, string[]>>({})
+  const prevRunningRef = useRef<Set<string>>(new Set())
   const doneTimersRef = useRef<Record<string, number>>({})
 
 
   const current = tree?.rooms.find(r => r.id === room)
   const project = tree?.projects.find(p => p.id === current?.project)
   const input = drafts[room] || ''
+  const images = draftImages[room] || []
+
+  function setImages(next: ImageDraft[] | ((prev: ImageDraft[]) => ImageDraft[]), targetRoom: string = room) {
+    if (!targetRoom) return
+    setDraftImages(prev => {
+      const cur = prev[targetRoom] || []
+      const resolved = typeof next === 'function' ? next(cur) : next
+      if (resolved.length === 0) {
+        if (!(targetRoom in prev)) return prev
+        const copy = { ...prev }
+        delete copy[targetRoom]
+        return copy
+      }
+      return { ...prev, [targetRoom]: resolved }
+    })
+  }
+
+  const sentHistory = useMemo(() => {
+    const out: string[] = []
+    for (const m of roomMessages) {
+      if (m.author !== '我') continue
+      const { display } = parseUserBody(m.body)
+      const cleaned = display.replace(LEADING_MENTIONS_RE, '').trim()
+      const text = cleaned || display.trim()
+      if (text) out.push(text)
+    }
+    return out
+  }, [roomMessages])
+  const historyIdxRef = useRef(-1)
+  const historyDraftRef = useRef('')
+  useEffect(() => {
+    historyIdxRef.current = -1
+    historyDraftRef.current = ''
+  }, [room])
 
   const textarea = useRef<HTMLTextAreaElement>(null)
   const composerInputWrapRef = useRef<HTMLDivElement>(null)
@@ -677,7 +891,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
   const runningInRoom = (tree?.running || []).filter(j => j.room === room)
   const busyAgents = new Set<Agent>([
     ...runningInRoom.map(j => j.agent),
-    ...(messages.filter(m => m.status === '执行中').map(m => m.author as Agent))
+    ...(roomMessages.filter(m => m.status === '执行中').map(m => m.author as Agent))
   ])
   const anyBusy = busyAgents.size > 0
   const targetBusy = activeTargets.some(a => busyAgents.has(a))
@@ -723,37 +937,51 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
   }, [])
 
   useEffect(() => {
-    void api.agentSkills(room).then(setAgentSkills).catch(() => {})
+    let alive = true
+    void api.agentSkills(room).then(res => { if (alive) setAgentSkills(res) }).catch(() => {})
+    return () => { alive = false }
   }, [room, project?.id])
 
-  const runningRoomsKey = (tree?.running || []).map(j => j.room).sort().join(',')
+  // A preview or lightbox belongs to the room it was opened in; relative links would
+  // otherwise resolve against the next room's project.
   useEffect(() => {
-    const curr = new Set((tree?.running || []).map(j => j.room))
-    const prev = prevRunningRoomsRef.current
-    const finished: string[] = []
-    for (const rId of prev) {
-      if (!curr.has(rId)) finished.push(rId)
-    }
-    prevRunningRoomsRef.current = curr
-    if (!finished.length) return
+    previewSeqRef.current++
+    setPreviewOpen(false)
+    setPreviewData(null)
+    setPreviewErr('')
+    setPreviewLoading(false)
+    setLightbox(null)
+  }, [room])
+
+  const runningKey = (tree?.running || []).map(j => runKey(j.room, j.agent)).sort().join('|')
+  useEffect(() => {
+    const running = tree?.running || []
+    const finished = finishedAgentsByRoom(prevRunningRef.current, running)
+    prevRunningRef.current = new Set(running.map(j => runKey(j.room, j.agent)))
+    const finishedRooms = Object.keys(finished)
+    if (!finishedRooms.length) return
     const focused = document.hasFocus()
+    const merge = (old: Record<string, string[]>, rId: string) => {
+      const prevList = old[rId] || []
+      const add = finished[rId].filter(a => !prevList.includes(a))
+      return add.length ? [...prevList, ...add] : prevList
+    }
     setUnreadDoneRooms(old => {
       let changed = false
       const next = { ...old }
-      for (const rId of finished) {
-        if (rId !== room || !focused) {
-          next[rId] = true
-          changed = true
-        }
+      for (const rId of finishedRooms) {
+        if (rId === room && focused) continue
+        const merged = merge(old, rId)
+        if (merged !== old[rId]) { next[rId] = merged; changed = true }
       }
       return changed ? next : old
     })
     setJustDoneRooms(old => {
       const next = { ...old }
-      for (const rId of finished) next[rId] = true
+      for (const rId of finishedRooms) next[rId] = merge(old, rId)
       return next
     })
-    for (const rId of finished) {
+    for (const rId of finishedRooms) {
       if (doneTimersRef.current[rId]) window.clearTimeout(doneTimersRef.current[rId])
       doneTimersRef.current[rId] = window.setTimeout(() => {
         delete doneTimersRef.current[rId]
@@ -765,7 +993,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
         })
       }, 2400)
     }
-  }, [runningRoomsKey, room])
+  }, [runningKey, room])
 
   useEffect(() => {
     if (!room) return
@@ -865,16 +1093,50 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
   }, [slashIdx, slashQuery, Boolean(slash)])
 
   useEffect(() => {
-    let alive = true, seq = 0
+    // Change events arrive up to ~16/s while agents stream. Keep one request in flight,
+    // coalesce the rest into a single trailing refresh, and fetch only changed messages
+    // so unchanged rows keep their object identity (memoized rows skip re-rendering).
+    let alive = true, inflight = false, pending = false
+    let byId = new Map<string, Msg>()
+    let sigs: Record<string, string> = {}
+    let lastTreeJson = ''
     async function refresh() {
-      const n = ++seq
+      if (inflight) { pending = true; return }
+      inflight = true
       try {
-        const [t, m] = await Promise.all([api.tree(), room ? api.messages(room) : Promise.resolve([])])
-        if (!alive || seq !== n) return
-        setTree(t); setMessages(m); setMessagesRoom(room)
+        const [t, delta] = await Promise.all([api.tree(), room ? api.messagesDelta(room, sigs) : Promise.resolve({ ids: [], rows: [] })])
+        if (!alive) return
+        const treeJson = JSON.stringify(t)
+        if (treeJson !== lastTreeJson) { lastTreeJson = treeJson; setTree(t) }
+        const nextById = new Map<string, Msg>()
+        const nextSigs: Record<string, string> = {}
+        for (const row of delta.rows) {
+          const { sig, ...msg } = row
+          nextById.set(msg.id, msg)
+          nextSigs[msg.id] = sig
+        }
+        let changed = delta.rows.length > 0 || delta.ids.length !== byId.size
+        const list: Msg[] = []
+        for (const id of delta.ids) {
+          const msg = nextById.get(id) || byId.get(id)
+          if (!msg) continue
+          if (!nextById.has(id)) { nextById.set(id, msg); nextSigs[id] = sigs[id] }
+          list.push(msg)
+        }
+        if (!changed) changed = list.some((m, i) => m.id !== delta.ids[i])
+        byId = nextById
+        sigs = nextSigs
+        if (changed || !messagesLoadedRef.current) { setMessages(list); messagesLoadedRef.current = true }
+        setMessagesRoom(room)
         if (!t.rooms.some(r => r.id === room) && t.rooms.length) setRoom(t.rooms[0].id)
-      } catch (e) { if (alive) setError(cleanError(e)) }
+      } catch (e) {
+        if (alive) setError(cleanError(e))
+      } finally {
+        inflight = false
+        if (alive && pending) { pending = false; void refresh() }
+      }
     }
+    messagesLoadedRef.current = false
     void refresh()
     const off = api.listen(() => void refresh())
     return () => { alive = false; off() }
@@ -944,7 +1206,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
     catch (e) { setError(cleanError(e)) }
   }
 
-  /** Sidebar inline rename (the chat header manages its own draft and calls renameRoom). */
+  /** Sidebar inline rename of a discussion. */
   async function commitRename(id: string) {
     setEditingRoom('')
     await renameRoom(id, editTitle)
@@ -1049,6 +1311,8 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
   }
 
   async function addImageFiles(files: FileList | File[]) {
+    const targetRoom = room
+    if (!targetRoom) return
     const list = Array.from(files).slice(0, 8 - images.length)
     for (const file of list) {
       if (file.size > 25 * 1024 * 1024) {
@@ -1063,7 +1327,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
         reader.readAsDataURL(file)
       })
       if (dataUrl) {
-        setImages(prev => [...prev, { id: Math.random().toString(36).slice(2), name: file.name || (isImage ? 'image.png' : 'file'), dataUrl, isImage }])
+        setImages(prev => prev.length >= 8 ? prev : [...prev, { id: Math.random().toString(36).slice(2), name: file.name || (isImage ? 'image.png' : 'file'), dataUrl, isImage }], targetRoom)
       }
     }
   }
@@ -1113,17 +1377,30 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
         }
         return changed ? next : prev
       })
-      return true
+      return true as const
     } catch (e) {
-      setError(cleanError(e))
-      if (payload.restoreOnFail && payload.room === room) setInput(payload.raw)
-      return false
+      const message = cleanError(e)
+      setError(message)
+      if (payload.restoreOnFail) {
+        setDrafts(prev => (prev[payload.room] ? prev : { ...prev, [payload.room]: payload.raw }))
+        if (payload.images.length) {
+          setImages(prev => prev.length ? prev : payload.images.map(img => ({
+            id: Math.random().toString(36).slice(2),
+            name: img.name,
+            dataUrl: img.dataUrl,
+            isImage: img.dataUrl.startsWith('data:image/')
+          })), payload.room)
+        }
+      }
+      return message || '发送失败'
     }
   }
 
   function enqueueCurrent() {
     const item = resolveCurrentDraft()
     if (!item) return
+    historyIdxRef.current = -1
+    historyDraftRef.current = ''
     setInput('')
     setImages([])
     setMention(null)
@@ -1135,6 +1412,8 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
     const item = queuedItem || resolveCurrentDraft()
     if (!item) return
     if (!queuedItem) {
+      historyIdxRef.current = -1
+      historyDraftRef.current = ''
       setInput('')
       setImages([])
       setMention(null)
@@ -1151,7 +1430,21 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
 
   function cancelQueued(roomId: string, itemId: string, restore = false) {
     const target = sendQueue.remove(roomId, itemId)
-    if (restore && target && roomId === room && !input.trim()) setInput(target.raw)
+    if (restore && target) {
+      // Merge into whatever is already being typed instead of silently discarding the queued text.
+      setDrafts(prev => {
+        const cur = prev[roomId] || ''
+        return { ...prev, [roomId]: cur.trim() ? cur.trimEnd() + '\n' + target.raw : target.raw }
+      })
+      if (target.images?.length) {
+        setImages(prev => [...prev, ...target.images.map(img => ({
+          id: Math.random().toString(36).slice(2),
+          name: img.name,
+          dataUrl: img.dataUrl,
+          isImage: img.dataUrl.startsWith('data:image/')
+        }))].slice(0, 8), roomId)
+      }
+    }
   }
 
   async function send(overrideText?: string, overrideTarget?: Agent | Agent[] | 'all') {
@@ -1170,7 +1463,12 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
       return
     }
     const sendImages = overrideText ? [] : images.map(i => ({ name: i.name, dataUrl: i.dataUrl }))
-    if (!overrideText) { setInput(''); setImages([]) }
+    if (!overrideText) {
+      historyIdxRef.current = -1
+      historyDraftRef.current = ''
+      setInput('')
+      setImages([])
+    }
     await dispatchPayload({
       room,
       raw,
@@ -1182,11 +1480,13 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
   }
 
   function handleRetry(a: Agent, msgId: string) {
-    const idx = messages.findIndex(m => m.id === msgId)
-    const slice = idx > 0 ? messages.slice(0, idx) : messages
-    const lastUser = [...slice].reverse().find(m => m.author === '我')
+    // Retry the user message that triggered this reply (the nearest one before it).
+    const idx = roomMessages.findIndex(m => m.id === msgId)
+    if (idx < 0) return
+    const lastUser = [...roomMessages.slice(0, idx)].reverse().find(m => m.author === '我')
     if (!lastUser) return
-    const task = lastUser.body.replace(LEADING_MENTIONS_RE, '').trim()
+    // Synced messages may carry the <group_context>/<user_task> envelope; resend only the task.
+    const task = parseUserBody(lastUser.body).display.replace(LEADING_MENTIONS_RE, '').trim()
     if (task) void send('@' + a + ' ' + task, a)
   }
 
@@ -1201,15 +1501,81 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
     textarea.current?.focus()
   }
 
+  useEffect(() => {
+    if (!copyToast) return
+    const t = setTimeout(() => setCopyToast(''), 1800)
+    return () => clearTimeout(t)
+  }, [copyToast])
+
+  useEffect(() => {
+    if (!fileMenu) return
+    const close = () => setFileMenu(null)
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setFileMenu(null) }
+    window.addEventListener('mousedown', close)
+    window.addEventListener('scroll', close, true)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('mousedown', close)
+      window.removeEventListener('scroll', close, true)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [fileMenu])
+
+  async function handlePreviewFile(targetPath: string) {
+    if (!targetPath) return
+    // Only the latest request may update the panel (a slow large file must not replace a newer one).
+    const seq = ++previewSeqRef.current
+    setPreviewOpen(true)
+    setPreviewLoading(true)
+    setPreviewErr('')
+    try {
+      const res = await api.previewFile(room, targetPath)
+      if (seq !== previewSeqRef.current) return
+      setPreviewData(res)
+    } catch (e) {
+      if (seq !== previewSeqRef.current) return
+      setPreviewData(null)
+      setPreviewErr(cleanError(e))
+    } finally {
+      if (seq === previewSeqRef.current) setPreviewLoading(false)
+    }
+  }
+
+  function handleFileContextMenu(e: React.MouseEvent, absPath: string, allowPreview = true) {
+    if (!absPath) return
+    e.preventDefault()
+    e.stopPropagation()
+    const menuW = 180
+    const menuH = allowPreview ? 142 : 108
+    const x = Math.min(e.clientX, window.innerWidth - menuW - 8)
+    const y = Math.min(e.clientY, window.innerHeight - menuH - 8)
+    setFileMenu({ x: Math.max(8, x), y: Math.max(8, y), path: absPath, allowPreview })
+  }
+
+  function copyAbsPath(absPath: string) {
+    if (!absPath) return
+    void navigator.clipboard.writeText(absPath)
+    setCopyToast('已复制绝对路径')
+    setFileMenu(null)
+  }
+
+  function handleOpenLightbox(items: LightboxImageItem[], index: number) {
+    if (!items.length) return
+    setLightbox({ items, index: Math.max(0, Math.min(index, items.length - 1)) })
+  }
+
   // AgentMessage is memoized and ignores callback identity, so hand it stable wrappers
   // that always call the latest handlers (otherwise retry/continue on an old message
   // would send with stale access modes / models captured at that message's last render).
-  const latestHandlers = useRef({ handleRetry, handleContinue, handleForward })
-  latestHandlers.current = { handleRetry, handleContinue, handleForward }
+  const latestHandlers = useRef({ handleRetry, handleContinue, handleForward, handlePreviewFile, handleOpenLightbox, handleFileContextMenu })
+  latestHandlers.current = { handleRetry, handleContinue, handleForward, handlePreviewFile, handleOpenLightbox, handleFileContextMenu }
   const messageHandlers = useMemo(() => ({
     onRetry: (a: Agent, msgId: string) => latestHandlers.current.handleRetry(a, msgId),
     onContinue: (a: Agent) => latestHandlers.current.handleContinue(a),
-    onForward: (from: string, to: Agent, body: string) => latestHandlers.current.handleForward(from, to, body)
+    onForward: (from: string, to: Agent, body: string) => latestHandlers.current.handleForward(from, to, body),
+    onPreviewFile: (targetPath: string) => { void latestHandlers.current.handlePreviewFile(targetPath) },
+    onOpenLightbox: (items: LightboxImageItem[], index: number) => latestHandlers.current.handleOpenLightbox(items, index),
+    onFileContextMenu: (e: React.MouseEvent, absPath: string, allowPreview = true) => latestHandlers.current.handleFileContextMenu(e, absPath, allowPreview)
   }), [])
 
   const missingCount = tree ? agents.filter(a => !tree.agents[a]).length : 0
@@ -1249,8 +1615,8 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
               const projRooms = tree.rooms.filter(r => r.project === p.id)
               const projRoomIds = new Set(projRooms.map(r => r.id))
               const projRunningAgents = [...new Set((tree.running || []).filter(j => projRoomIds.has(j.room)).map(j => j.agent))]
-              const projHasUnreadDone = projRooms.some(r => unreadDoneRooms[r.id])
-              const projJustDone = projRooms.some(r => justDoneRooms[r.id])
+              const projDoneAgents = [...new Set(projRooms.flatMap(r => [...(unreadDoneRooms[r.id] || []), ...(justDoneRooms[r.id] || [])]))]
+              const projJustDone = [...new Set(projRooms.flatMap(r => justDoneRooms[r.id] || []))]
               return (
                 <section key={p.id} className="project-group">
                   <div className={'navrow projectrow ' + (isOpen ? 'open' : '') + (isCurrentProj ? ' current' : '')}>
@@ -1262,7 +1628,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
                         onChange={e => setEditProjectName(e.target.value)}
                         onBlur={() => void commitRenameProject(p.id)}
                         onKeyDown={e => {
-                          if (e.key === 'Enter') void commitRenameProject(p.id)
+                          if (e.key === 'Enter' && !e.nativeEvent.isComposing) void commitRenameProject(p.id)
                           if (e.key === 'Escape') setEditingProject('')
                         }}
                       />
@@ -1271,20 +1637,13 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
                         <button
                           type="button"
                           className="project"
-                          title={p.dir + ' · 点击展开或收起，双击可重命名'}
+                          title={p.dir + ' · 点击展开或收起'}
                           onClick={() => setExpandedProjects(prev => ({ ...prev, [p.id]: !isOpen }))}
-                          onDoubleClick={e => { e.stopPropagation(); setEditingProject(p.id); setEditProjectName(p.name) }}
                         >
                           <ChevronRight size={13} className={'proj-caret ' + (isOpen ? 'open' : '')} />
                           {isOpen ? <FolderOpen size={15} /> : <Folder size={15} />}
                           <span>{p.name}</span>
-                          {projRunningAgents.length > 0 ? (
-                            <span className="room-dots" title={projRunningAgents.map(a => a + ' 执行中').join('、')}>
-                              {projRunningAgents.map(a => <i key={a} className={'dot ' + agentClass[a]} />)}
-                            </span>
-                          ) : (projHasUnreadDone || projJustDone) ? (
-                            <span className={'done-dot' + (projJustDone ? ' pulse' : '')} title="项目中有任务已完成" />
-                          ) : null}
+                          <AgentStatusDots running={projRunningAgents} done={projDoneAgents} justDone={projJustDone} scope="项目中" />
                         </button>
                         <div className="row-actions">
                           <button
@@ -1314,8 +1673,8 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
                     <div className="rooms">
                       {projRooms.map(r => {
                         const roomJobs = (tree.running || []).filter(j => j.room === r.id)
-                        const roomUnreadDone = Boolean(unreadDoneRooms[r.id])
-                        const roomJustDone = Boolean(justDoneRooms[r.id])
+                        const roomJustDone = justDoneRooms[r.id] || []
+                        const roomDoneAgents = [...new Set([...(unreadDoneRooms[r.id] || []), ...roomJustDone])]
                         const isEditing = editingRoom === r.id
                         return (
                           <div key={r.id} className={'navrow roomrow ' + (r.id === room ? 'active' : '')}>
@@ -1327,7 +1686,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
                                 onChange={e => setEditTitle(e.target.value)}
                                 onBlur={() => void commitRename(r.id)}
                                 onKeyDown={e => {
-                                  if (e.key === 'Enter') void commitRename(r.id)
+                                  if (e.key === 'Enter' && !e.nativeEvent.isComposing) void commitRename(r.id)
                                   if (e.key === 'Escape') setEditingRoom('')
                                 }}
                               />
@@ -1337,17 +1696,10 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
                                   type="button"
                                   className="roomlink"
                                   onClick={() => setRoom(r.id)}
-                                  onDoubleClick={() => { setEditingRoom(r.id); setEditTitle(r.title) }}
                                 >
                                   <MessageSquare size={13} />
                                   <span>{r.title}</span>
-                                  {roomJobs.length > 0 ? (
-                                    <span className="room-dots" title={roomJobs.map(j => j.agent + ' 执行中').join('、')}>
-                                      {roomJobs.map(j => <i key={j.agent} className={'dot ' + agentClass[j.agent]} />)}
-                                    </span>
-                                  ) : (roomUnreadDone || roomJustDone) ? (
-                                    <span className={'done-dot' + (roomJustDone ? ' pulse' : '')} title="任务已完成" />
-                                  ) : null}
+                                  <AgentStatusDots running={roomJobs.map(j => j.agent)} done={roomDoneAgents} justDone={roomJustDone} />
                                 </button>
                                 <div className="row-actions">
                                   <button
@@ -1403,7 +1755,6 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
           onNewRoom={() => void newRoom()}
           project={project || null}
           currentRoom={current || null}
-          onRename={(id, title) => void renameRoom(id, title)}
           onOpenProjectDir={dir => void api.openPath(dir)}
           members={
             <RoomMembersPicker
@@ -1436,7 +1787,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
             follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100
           }}
         >
-          {!messages.length ? (
+          {messagesRoom === room && !roomMessages.length ? (
             <div className="welcome">
               <div className="symbol">
                 {project ? <Sparkles size={26} /> : <Compass size={28} />}
@@ -1457,7 +1808,8 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
                         <button
                           key={a}
                           type="button"
-                          className={'quick-agent-card ' + agentClass[a] + (activeTargets.includes(a) ? ' selected' : '')}
+                          className={'quick-agent-card agent-tinted ' + agentClass[a] + (activeTargets.includes(a) ? ' selected' : '')}
+                          style={agentTint(a)}
                           onClick={e => { toggleAgent(a, e.metaKey || e.shiftKey) }}
                         >
                           <Icon name={a} size={20} />
@@ -1502,16 +1854,42 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
               )}
             </div>
           ) : (
+            <ProjectDirContext.Provider value={project?.dir || ''}>
             <div className="transcript">
               {(() => {
-                const lastAgentMsgId = [...messages].reverse().find(x => x.author !== '我')?.id
-                return messages.map(m =>
+                const lastAgentMsgId = [...roomMessages].reverse().find(x => x.author !== '我')?.id
+                return roomMessages.map(m =>
                   m.author === '我'
-                    ? <UserBubble key={m.id} body={m.body} attachments={m.attachments} log={m.log} />
-                    : <AgentMessage key={m.id} m={m} roomId={room} isLatest={m.id === lastAgentMsgId} onStop={a => void api.stop(room, a)} onRetry={messageHandlers.onRetry} onContinue={messageHandlers.onContinue} onForward={messageHandlers.onForward} />
+                    ? (
+                      <UserBubble
+                        key={m.id}
+                        body={m.body}
+                        attachments={m.attachments}
+                        log={m.log}
+                        onPreviewFile={messageHandlers.onPreviewFile}
+                        onOpenLightbox={messageHandlers.onOpenLightbox}
+                        onFileContextMenu={messageHandlers.onFileContextMenu}
+                      />
+                    ) : (
+                      <AgentMessage
+                        key={m.id}
+                        m={m}
+                        roomId={room}
+                        projectDir={project?.dir}
+                        isLatest={m.id === lastAgentMsgId}
+                        onStop={a => void api.stop(room, a)}
+                        onRetry={messageHandlers.onRetry}
+                        onContinue={messageHandlers.onContinue}
+                        onForward={messageHandlers.onForward}
+                        onPreviewFile={messageHandlers.onPreviewFile}
+                        onOpenLightbox={messageHandlers.onOpenLightbox}
+                        onFileContextMenu={messageHandlers.onFileContextMenu}
+                      />
+                    )
                 )
               })()}
             </div>
+            </ProjectDirContext.Provider>
           )}
         </div>
         <OverlayScrollbar targetRef={scroll} hoverRef={timelineShellRef} variant="timeline" insetTop={8} insetBottom={8} />
@@ -1630,6 +2008,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
                 }}
                 onChange={e => {
                   const v = e.target.value
+                  historyIdxRef.current = -1
                   setInput(v)
                   detectTriggers(v, e.target.selectionStart)
                 }}
@@ -1671,6 +2050,46 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
                       e.preventDefault()
                       const chosen = slashOptions[slashIdx] || slashOptions[0]
                       if (chosen) insertSlash(chosen.text)
+                      return
+                    }
+                  }
+                  if (!e.nativeEvent.isComposing && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
+                    const el = e.currentTarget
+                    const selStart = el.selectionStart
+                    const selEnd = el.selectionEnd
+                    if (e.key === 'ArrowUp' && sentHistory.length > 0 && selStart === selEnd && !el.value.slice(0, selStart).includes('\n')) {
+                      e.preventDefault()
+                      if (historyIdxRef.current === -1) {
+                        historyDraftRef.current = input
+                        historyIdxRef.current = sentHistory.length - 1
+                      } else if (historyIdxRef.current > 0) {
+                        historyIdxRef.current -= 1
+                      }
+                      const nextText = sentHistory[historyIdxRef.current]
+                      setInput(nextText)
+                      setMention(null)
+                      setSlash(null)
+                      requestAnimationFrame(() => {
+                        textarea.current?.setSelectionRange(nextText.length, nextText.length)
+                      })
+                      return
+                    }
+                    if (e.key === 'ArrowDown' && historyIdxRef.current !== -1 && selStart === selEnd && !el.value.slice(selEnd).includes('\n')) {
+                      e.preventDefault()
+                      let nextText: string
+                      if (historyIdxRef.current < sentHistory.length - 1) {
+                        historyIdxRef.current += 1
+                        nextText = sentHistory[historyIdxRef.current]
+                      } else {
+                        historyIdxRef.current = -1
+                        nextText = historyDraftRef.current
+                      }
+                      setInput(nextText)
+                      setMention(null)
+                      setSlash(null)
+                      requestAnimationFrame(() => {
+                        textarea.current?.setSelectionRange(nextText.length, nextText.length)
+                      })
                       return
                     }
                   }
@@ -1772,16 +2191,80 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
         )}
       </main>
 
+      {previewOpen && (
+        <FilePreviewPanel
+          preview={previewData}
+          loading={previewLoading}
+          error={previewErr}
+          roomId={room}
+          projectDir={project?.dir}
+          onClose={() => { setPreviewOpen(false); setPreviewData(null); setPreviewErr('') }}
+          onPreviewFile={messageHandlers.onPreviewFile}
+          onOpenLightbox={messageHandlers.onOpenLightbox}
+          onFileContextMenu={messageHandlers.onFileContextMenu}
+        />
+      )}
+
+      {lightbox && (
+        <ImageLightbox
+          items={lightbox.items}
+          index={lightbox.index}
+          roomId={room}
+          projectDir={project?.dir}
+          onIndexChange={next => setLightbox(prev => (prev ? { ...prev, index: next } : null))}
+          onClose={() => setLightbox(null)}
+          onOpenInSidePanel={p => void handlePreviewFile(p)}
+          onFileContextMenu={messageHandlers.onFileContextMenu}
+        />
+      )}
+
       {showFiles && project && (
         <FileDrawer
           roomId={room}
           projectName={project.name}
+          activePreviewPath={previewOpen ? previewData?.path : undefined}
           onClose={() => setShowFiles(false)}
           onInsertPath={relPath => {
             setInput((input ? input.trimEnd() + ' ' : '') + relPath + ' ')
             textarea.current?.focus()
           }}
+          onPreviewFile={messageHandlers.onPreviewFile}
+          onFileContextMenu={messageHandlers.onFileContextMenu}
         />
+      )}
+
+      {fileMenu && (
+        <div
+          className="file-ctx-menu"
+          style={{ left: fileMenu.x, top: fileMenu.y }}
+          onMouseDown={e => e.stopPropagation()}
+        >
+          <button type="button" onClick={() => copyAbsPath(fileMenu.path)}>
+            <Copy size={13} />
+            <span>复制绝对路径</span>
+          </button>
+          {fileMenu.allowPreview && (
+            <button type="button" onClick={() => { const p = fileMenu.path; setFileMenu(null); void handlePreviewFile(p) }}>
+              <Eye size={13} />
+              <span>在右侧预览</span>
+            </button>
+          )}
+          <button type="button" onClick={() => { const p = fileMenu.path; setFileMenu(null); void api.openPath(p, room) }}>
+            <ExternalLink size={13} />
+            <span>用系统应用打开</span>
+          </button>
+          <button type="button" onClick={() => { const p = fileMenu.path; setFileMenu(null); void api.revealPath(p, room) }}>
+            <FolderSearch size={13} />
+            <span>在访达中显示</span>
+          </button>
+        </div>
+      )}
+
+      {copyToast && (
+        <div className="copy-toast" role="status">
+          <Check size={13} />
+          <span>{copyToast}</span>
+        </div>
       )}
 
       {project && (

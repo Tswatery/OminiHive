@@ -89,6 +89,54 @@ export const AGENT_CLASS: Record<Agent, string> = {
   OhMyPi: 'codex'
 }
 
+/** Per-agent accent used for sidebar status dots; core agents follow theme tokens. */
+export const AGENT_COLOR: Record<Agent, string> = {
+  Codex: 'var(--agent-codex)',
+  Claude: 'var(--agent-claude)',
+  Antigravity: 'var(--agent-antigravity)',
+  WorkBuddy: '#10b981',
+  Gemini: '#8b5cf6',
+  OpenCode: '#64748b',
+  Kimi: '#84cc16',
+  Qwen: '#c026d3',
+  OpenClaw: '#dc2626',
+  Grok: '#71717a',
+  Hermes: '#d97706',
+  Pi: '#14b8a6',
+  MiniMax: '#e11d48',
+  DeepSeek: '#3b82f6',
+  OhMyPi: '#78716c'
+}
+
+export function agentColor(name: string): string {
+  return (AGENT_COLOR as Record<string, string>)[name] || 'var(--accent)'
+}
+
+/**
+ * Compare running (room, agent) pairs between two snapshots and return, per room,
+ * the agents that just stopped running.
+ */
+export function finishedAgentsByRoom(
+  prev: Iterable<string>,
+  running: { room: string; agent: string }[]
+): Record<string, string[]> {
+  const curr = new Set(running.map(j => runKey(j.room, j.agent)))
+  const out: Record<string, string[]> = {}
+  for (const key of prev) {
+    if (curr.has(key)) continue
+    const i = key.indexOf('\u0000')
+    if (i < 0) continue
+    const room = key.slice(0, i)
+    const agent = key.slice(i + 1)
+    ;(out[room] ||= []).includes(agent) || out[room].push(agent)
+  }
+  return out
+}
+
+export function runKey(room: string, agent: string): string {
+  return room + '\u0000' + agent
+}
+
 export const AGENT_KEYWORDS: Record<Agent, string> = {
   Codex: 'codex openai gpt',
   Claude: 'claude anthropic cc',

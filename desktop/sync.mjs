@@ -40,8 +40,31 @@ function fingerprint(role, text) {
   return `${role}:${norm.length}:${head}|${tail}`
 }
 
+// Parsed transcripts keyed by path and invalidated by mtime/size: background sync runs often,
+// and re-reading + JSON-parsing a multi-MB rollout every time stalls the main process.
+const parsedCache = new Map()
+function cachedParse(filePath, parse) {
+  let st
+  try { st = statSync(filePath) } catch { return [] }
+  const hit = parsedCache.get(filePath)
+  if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.turns
+  const turns = parse(filePath)
+  parsedCache.set(filePath, { mtimeMs: st.mtimeMs, size: st.size, turns })
+  if (parsedCache.size > 64) parsedCache.delete(parsedCache.keys().next().value)
+  return turns
+}
+
+const rolloutPathCache = new Map()
 function findCodexRollout(threadId) {
   if (!threadId) return null
+  const cachedPath = rolloutPathCache.get(threadId)
+  if (cachedPath && existsSync(cachedPath)) return cachedPath
+  const found = findCodexRolloutUncached(threadId)
+  if (found) rolloutPathCache.set(threadId, found)
+  return found
+}
+
+function findCodexRolloutUncached(threadId) {
   const codexHome = process.env.CODEX_HOME || path.join(homedir(), '.codex')
   const dbPath = path.join(codexHome, 'state_5.sqlite')
   if (existsSync(dbPath)) {
@@ -383,10 +406,10 @@ export async function syncRoomExternal(store, roomId, busyAgents = new Set()) {
     let turns = null
     if (agent === 'Codex') {
       const rollout = findCodexRollout(nativeId)
-      if (rollout) turns = parseCodexRollout(rollout)
+      if (rollout) turns = cachedParse(rollout, parseCodexRollout)
     } else if (agent === 'Claude') {
       const transcript = findClaudeTranscript(nativeId, cwd)
-      if (transcript) turns = parseClaudeTranscript(transcript)
+      if (transcript) turns = cachedParse(transcript, parseClaudeTranscript)
     } else if (agent === 'Antigravity') {
       turns = await readDesktopHistory(nativeId).catch(() => null)
     }
