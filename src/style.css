@@ -2276,7 +2276,28 @@ main {
   display: block;
 }
 
-.draft-img button {
+.draft-img .draft-img-open {
+  display: block;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  cursor: zoom-in;
+  transition: opacity 120ms ease;
+}
+
+.draft-img .draft-img-open:hover {
+  opacity: 0.88;
+}
+
+.draft-img .draft-img-open:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.draft-img .draft-img-remove {
   position: absolute;
   top: 3px;
   right: 3px;
@@ -2338,6 +2359,23 @@ main {
   object-fit: cover;
   cursor: pointer;
   border: 1px solid var(--border-subtle);
+}
+
+.bubble-imgs img:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.bubble-img-missing {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px dashed var(--border-strong);
+  color: var(--text-muted);
+  font-size: 12px;
 }
 
 .bubble-img-skeleton {
@@ -4530,7 +4568,7 @@ main {
   position: fixed;
   /* Floating layers must opt out of window-drag regions underneath them. */
   -webkit-app-region: no-drag;
-  z-index: 120;
+  z-index: 170;
   min-width: 168px;
   padding: 5px;
   border-radius: 10px;
@@ -4564,7 +4602,7 @@ main {
   bottom: 24px;
   left: 50%;
   transform: translateX(-50%);
-  z-index: 130;
+  z-index: 180;
   display: inline-flex;
   align-items: center;
   gap: 6px;

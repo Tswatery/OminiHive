@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { Check, ChevronLeft, ChevronRight, Copy, ExternalLink, FolderSearch, Image as ImageIcon, PanelRight, X, ZoomIn, ZoomOut } from 'lucide-react'
+import { Check, ChevronLeft, ChevronRight, Copy, ExternalLink, FolderSearch, Image as ImageIcon, Link2, PanelRight, X, ZoomIn, ZoomOut } from 'lucide-react'
 import { friendlyDir, friendlyFileName, imageMetaLine } from './filePresentation'
 
 export type LightboxImageItem = {
@@ -54,6 +54,35 @@ export async function loadLocalImage(roomId: string | undefined, targetPath: str
   })()
   INFLIGHT.set(key, p)
   return p
+}
+
+/** Re-encodes any browser-decodable image (svg, webp, gif, jpeg…) as PNG for the system clipboard. */
+function toPngDataUrl(dataUrl: string): Promise<string> {
+  if (dataUrl.startsWith('data:image/png;base64,')) return Promise.resolve(dataUrl)
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => {
+      const w = img.naturalWidth || 1024
+      const h = img.naturalHeight || 768
+      const canvas = document.createElement('canvas')
+      canvas.width = w
+      canvas.height = h
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return reject(Error('无法复制该图片'))
+      ctx.drawImage(img, 0, 0, w, h)
+      resolve(canvas.toDataURL('image/png'))
+    }
+    img.onerror = () => reject(Error('无法复制该图片'))
+    img.src = dataUrl
+  })
+}
+
+/** Copies the image itself (not its path) to the system clipboard. */
+export async function copyImageToClipboard(source: { path?: string; dataUrl?: string }, roomId?: string): Promise<void> {
+  let dataUrl = source.dataUrl || ''
+  if (!dataUrl && source.path) dataUrl = (await loadLocalImage(roomId, source.path))?.dataUrl || ''
+  if (!dataUrl) throw Error('图片无法读取，可能已被移动或删除')
+  await window.hive.copyImage(await toPngDataUrl(dataUrl))
 }
 
 export function LocalImageThumb({
@@ -135,7 +164,8 @@ export function ImageLightbox({
   onIndexChange,
   onClose,
   onOpenInSidePanel,
-  onFileContextMenu
+  onFileContextMenu,
+  onToast
 }: {
   items: LightboxImageItem[]
   index: number
@@ -144,7 +174,8 @@ export function ImageLightbox({
   onIndexChange: (nextIndex: number) => void
   onClose: () => void
   onOpenInSidePanel?: (path: string) => void
-  onFileContextMenu?: (e: React.MouseEvent, absPath: string, allowPreview?: boolean) => void
+  onFileContextMenu?: (e: React.MouseEvent, absPath: string, allowPreview?: boolean, extra?: { dataUrl?: string }) => void
+  onToast?: (message: string) => void
 }) {
   const safeIndex = Math.max(0, Math.min(index, items.length - 1))
   const current = items[safeIndex]
@@ -154,10 +185,12 @@ export function ImageLightbox({
   const [offset, setOffset] = useState({ x: 0, y: 0 })
   const [panning, setPanning] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [imageCopied, setImageCopied] = useState(false)
   const [dims, setDims] = useState<{ w: number; h: number } | null>(null)
   const stageRef = useRef<HTMLDivElement>(null)
   const dialogRef = useRef<HTMLDivElement>(null)
   const scaleRef = useRef(1)
+  const copyImageRef = useRef<() => Promise<void>>(async () => {})
 
   // Modal focus: move focus into the viewer, keep Tab inside it, restore it on close
   // (otherwise Enter/Space re-triggers the thumbnail button behind the overlay).
@@ -256,6 +289,10 @@ export function ImageLightbox({
       if (e.key === '=' || e.key === '+') { e.preventDefault(); applyScale(scaleRef.current * 1.25) }
       if (e.key === '-') { e.preventDefault(); applyScale(scaleRef.current / 1.25) }
       if (e.key === '0') { e.preventDefault(); resetZoom() }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'c' && !window.getSelection()?.toString()) {
+        e.preventDefault()
+        void copyImageRef.current()
+      }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
@@ -301,6 +338,19 @@ export function ImageLightbox({
     setTimeout(() => setCopied(false), 1500)
   }
 
+  async function copyImage() {
+    if (!resolved?.dataUrl) return
+    try {
+      await copyImageToClipboard({ dataUrl: resolved.dataUrl })
+      setImageCopied(true)
+      setTimeout(() => setImageCopied(false), 1500)
+      onToast?.('已复制图片')
+    } catch (err) {
+      onToast?.(err instanceof Error ? err.message : '无法复制该图片')
+    }
+  }
+  copyImageRef.current = copyImage
+
   return (
     <div
       ref={dialogRef}
@@ -336,9 +386,14 @@ export function ImageLightbox({
             </button>
           </div>
           <span className="lightbox-divider" />
+          {resolved?.dataUrl && (
+            <button type="button" className={'lightbox-btn' + (imageCopied ? ' done' : '')} onClick={() => void copyImage()} title={imageCopied ? '已复制图片' : '复制图片（⌘C）'} aria-label="复制图片">
+              {imageCopied ? <Check size={15} /> : <Copy size={15} />}
+            </button>
+          )}
           {absPath && (
             <button type="button" className={'lightbox-btn' + (copied ? ' done' : '')} onClick={copyPath} title={copied ? '已复制绝对路径' : '复制绝对路径'} aria-label="复制绝对路径">
-              {copied ? <Check size={15} /> : <Copy size={15} />}
+              {copied ? <Check size={15} /> : <Link2 size={15} />}
             </button>
           )}
           {absPath && onOpenInSidePanel && (
@@ -419,7 +474,7 @@ export function ImageLightbox({
               if (scale > 1.05) resetZoom()
               else applyScale(2)
             }}
-            onContextMenu={e => onFileContextMenu?.(e, absPath, true)}
+            onContextMenu={e => onFileContextMenu?.(e, absPath, Boolean(absPath), { dataUrl: resolved.dataUrl })}
           />
         ) : (
           <div className="lightbox-loading">无法加载该图片（文件可能已移动或删除）</div>

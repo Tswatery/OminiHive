@@ -3,7 +3,7 @@ const api = {}
 for (const key of [
   'tree', 'messages', 'messagesDelta', 'syncRoom', 'add', 'room', 'renameProject', 'renameRoom', 'externalSessions', 'importSession',
   'send', 'stop', 'remove',
-  'cachedModels', 'models', 'clients', 'ccSwitch', 'updates', 'upgrade', 'openExternal', 'openPath', 'revealPath',
+  'cachedModels', 'models', 'clients', 'ccSwitch', 'updates', 'upgrade', 'openExternal', 'openPath', 'revealPath', 'copyImage',
   'volcQuota', 'volcLogin', 'files', 'gitStatus', 'previewFile', 'agentSkills',
   'respondInteraction', 'focusAntigravity', 'setTheme'
 ]) {

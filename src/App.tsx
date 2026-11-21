@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client'
 import {
   Folder, FolderPlus, FolderOpen, MessageSquare, Plus, ArrowUp, Square,
   PanelLeft, Compass, Copy, Check,
-  RotateCcw, Sparkles, ChevronRight, ChevronDown, ChevronUp, X, Forward, Users, FileText, UserPlus, ExternalLink, Sun, Moon, Pencil, Eye, FolderSearch
+  RotateCcw, Sparkles, ChevronRight, ChevronDown, ChevronUp, X, Forward, Users, FileText, UserPlus, ExternalLink, Sun, Moon, Pencil, Eye, FolderSearch, Image as ImageIcon
 } from 'lucide-react'
 import { Theme, Button } from '@radix-ui/themes'
 import '@radix-ui/themes/styles.css'
@@ -17,7 +17,7 @@ import { buildMentionTools } from './mentions'
 import type { QuotaResult } from './VolcQuota'
 import { FileDrawer, type FileEntry, type GitStatusResult, type PreviewResult } from './FileDrawer'
 import { FilePreviewPanel } from './FilePreviewPanel'
-import { ImageLightbox, loadLocalImage, type LightboxImageItem } from './ImageLightbox'
+import { ImageLightbox, copyImageToClipboard, loadLocalImage, type LightboxImageItem } from './ImageLightbox'
 import { ImportSessionModal, type ExternalSessionItem } from './ImportSessionModal'
 import { OverlayScrollbar, ScrollArea } from './OverlayScrollbar'
 import { ExecutionTimeline, InlineStepGroup, ProjectDirContext, buildTimelineSegments, formatDuration, parseStepsWithMeta } from './ExecutionTimeline'
@@ -71,6 +71,7 @@ declare global {
       stop(id: string, agent?: Agent): Promise<void>
       openExternal(url: string): Promise<void>
       openPath(filePath: string, roomId?: string): Promise<boolean>
+      copyImage(pngDataUrl: string): Promise<boolean>
       revealPath(filePath: string, roomId?: string): Promise<boolean>
       respondInteraction(req: { cascadeId: string; trajectoryId?: string; stepIndex: number; payload: Record<string, unknown> }): Promise<boolean>
       focusAntigravity(): Promise<boolean>
@@ -273,14 +274,33 @@ function BubbleImage({ path, dataUrl, alt, onClick, onContextMenu }: {
   onContextMenu: (e: React.MouseEvent) => void
 }) {
   const [src, setSrc] = useState(dataUrl || '')
+  const [failed, setFailed] = useState(false)
   useEffect(() => {
+    setFailed(false)
     if (dataUrl) { setSrc(dataUrl); return }
     let alive = true
-    void loadLocalImage(undefined, path).then(res => { if (alive && res) setSrc(res.dataUrl) })
+    void loadLocalImage(undefined, path).then(res => {
+      if (!alive) return
+      if (res) setSrc(res.dataUrl)
+      else setFailed(true)
+    })
     return () => { alive = false }
   }, [path, dataUrl])
+  // A deleted attachment must not pulse as "loading" forever.
+  if (failed) return <span className="bubble-img-missing" title={path}><FileText size={13} />{alt || '图片'}已不存在</span>
   if (!src) return <span className="bubble-img-skeleton" title={alt} />
-  return <img src={src} alt={alt} title={alt} onClick={onClick} onContextMenu={onContextMenu} />
+  return (
+    <img
+      src={src}
+      alt={alt}
+      title={alt + '（点击查看大图，右键可复制）'}
+      role="button"
+      tabIndex={0}
+      onClick={onClick}
+      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick() } }}
+      onContextMenu={onContextMenu}
+    />
+  )
 }
 
 const UserBubble = React.memo(function UserBubble({
@@ -699,7 +719,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
   const [previewLoading, setPreviewLoading] = useState(false)
   const [previewErr, setPreviewErr] = useState('')
   const [lightbox, setLightbox] = useState<{ items: LightboxImageItem[]; index: number } | null>(null)
-  const [fileMenu, setFileMenu] = useState<{ x: number; y: number; path: string; allowPreview: boolean } | null>(null)
+  const [fileMenu, setFileMenu] = useState<{ x: number; y: number; path: string; allowPreview: boolean; isImage: boolean; dataUrl?: string } | null>(null)
   const [copyToast, setCopyToast] = useState('')
   const [enabledAgents, setEnabledAgents] = useState<Record<string, boolean>>(() => loadJson('ominihive:enabled', { Codex: true, Claude: true, Antigravity: true }))
   const [roomMembersMap, setRoomMembersMap] = useState<Record<string, Agent[]>>(() => loadJson('ominihive:room-members', {}))
@@ -1316,7 +1336,9 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
   async function addImageFiles(files: FileList | File[]) {
     const targetRoom = room
     if (!targetRoom) return
-    const list = Array.from(files).slice(0, 8 - images.length)
+    const all = Array.from(files)
+    const list = all.slice(0, Math.max(0, 8 - images.length))
+    if (list.length < all.length) setError(`每条消息最多 8 个附件，已忽略 ${all.length - list.length} 个`)
     for (const file of list) {
       if (file.size > 25 * 1024 * 1024) {
         setError(`文件「${file.name}」超过 25MB 限制`)
@@ -1513,14 +1535,15 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
   useEffect(() => {
     if (!fileMenu) return
     const close = () => setFileMenu(null)
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setFileMenu(null) }
+    // Capture phase + stopPropagation: Esc closes only the menu, not a lightbox underneath it.
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.stopPropagation(); setFileMenu(null) } }
     window.addEventListener('mousedown', close)
     window.addEventListener('scroll', close, true)
-    window.addEventListener('keydown', onKey)
+    window.addEventListener('keydown', onKey, true)
     return () => {
       window.removeEventListener('mousedown', close)
       window.removeEventListener('scroll', close, true)
-      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('keydown', onKey, true)
     }
   }, [fileMenu])
 
@@ -1544,15 +1567,29 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
     }
   }
 
-  function handleFileContextMenu(e: React.MouseEvent, absPath: string, allowPreview = true) {
-    if (!absPath) return
+  /** `extra.dataUrl` lets in-memory images (composer drafts) offer "copy image" without a file path. */
+  function handleFileContextMenu(e: React.MouseEvent, absPath: string, allowPreview = true, extra?: { dataUrl?: string }) {
+    const dataUrl = extra?.dataUrl
+    if (!absPath && !dataUrl) return
     e.preventDefault()
     e.stopPropagation()
+    const isImage = Boolean(dataUrl) || IMAGE_PATH_RE.test(absPath)
+    const itemCount = (isImage ? 1 : 0) + (absPath ? 3 + (allowPreview ? 1 : 0) : 0)
     const menuW = 180
-    const menuH = allowPreview ? 142 : 108
+    const menuH = itemCount * 34 + 6
     const x = Math.min(e.clientX, window.innerWidth - menuW - 8)
     const y = Math.min(e.clientY, window.innerHeight - menuH - 8)
-    setFileMenu({ x: Math.max(8, x), y: Math.max(8, y), path: absPath, allowPreview })
+    setFileMenu({ x: Math.max(8, x), y: Math.max(8, y), path: absPath, allowPreview: allowPreview && Boolean(absPath), isImage, dataUrl })
+  }
+
+  async function copyImageFromMenu(menu: { path: string; dataUrl?: string }) {
+    setFileMenu(null)
+    try {
+      await copyImageToClipboard({ path: menu.path, dataUrl: menu.dataUrl }, room)
+      setCopyToast('已复制图片')
+    } catch (err) {
+      setCopyToast(cleanError(err))
+    }
   }
 
   function copyAbsPath(absPath: string) {
@@ -1578,7 +1615,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
     onForward: (from: string, to: Agent, body: string) => latestHandlers.current.handleForward(from, to, body),
     onPreviewFile: (targetPath: string) => { void latestHandlers.current.handlePreviewFile(targetPath) },
     onOpenLightbox: (items: LightboxImageItem[], index: number) => latestHandlers.current.handleOpenLightbox(items, index),
-    onFileContextMenu: (e: React.MouseEvent, absPath: string, allowPreview = true) => latestHandlers.current.handleFileContextMenu(e, absPath, allowPreview)
+    onFileContextMenu: (e: React.MouseEvent, absPath: string, allowPreview = true, extra?: { dataUrl?: string }) => latestHandlers.current.handleFileContextMenu(e, absPath, allowPreview, extra)
   }), [])
 
   const missingCount = tree ? agents.filter(a => !tree.agents[a]).length : 0
@@ -1928,8 +1965,20 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
                   {images.map(img => (
                     img.isImage ? (
                       <div key={img.id} className="draft-img">
-                        <img src={img.dataUrl} alt={img.name} title={img.name} />
-                        <button type="button" aria-label="移除附件" onClick={() => setImages(prev => prev.filter(x => x.id !== img.id))}>
+                        <button
+                          type="button"
+                          className="draft-img-open"
+                          title={img.name + '（点击查看大图）'}
+                          aria-label={'查看大图：' + img.name}
+                          onClick={() => {
+                            const drafts = images.filter(x => x.isImage)
+                            handleOpenLightbox(drafts.map(x => ({ path: '', name: x.name, dataUrl: x.dataUrl })), drafts.findIndex(x => x.id === img.id))
+                          }}
+                          onContextMenu={e => handleFileContextMenu(e, '', false, { dataUrl: img.dataUrl })}
+                        >
+                          <img src={img.dataUrl} alt={img.name} draggable={false} />
+                        </button>
+                        <button type="button" className="draft-img-remove" aria-label="移除附件" onClick={() => setImages(prev => prev.filter(x => x.id !== img.id))}>
                           <X size={11} />
                         </button>
                       </div>
@@ -2214,6 +2263,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
           onClose={() => setLightbox(null)}
           onOpenInSidePanel={p => void handlePreviewFile(p)}
           onFileContextMenu={messageHandlers.onFileContextMenu}
+          onToast={setCopyToast}
         />
       )}
 
@@ -2238,24 +2288,35 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
           style={{ left: fileMenu.x, top: fileMenu.y }}
           onMouseDown={e => e.stopPropagation()}
         >
-          <button type="button" onClick={() => copyAbsPath(fileMenu.path)}>
-            <Copy size={13} />
-            <span>复制绝对路径</span>
-          </button>
-          {fileMenu.allowPreview && (
-            <button type="button" onClick={() => { const p = fileMenu.path; setFileMenu(null); void handlePreviewFile(p) }}>
-              <Eye size={13} />
-              <span>在右侧预览</span>
+          {fileMenu.isImage && (
+            <button type="button" onClick={() => void copyImageFromMenu(fileMenu)}>
+              <ImageIcon size={13} />
+              <span>复制图片</span>
             </button>
           )}
-          <button type="button" onClick={() => { const p = fileMenu.path; setFileMenu(null); void api.openPath(p, room) }}>
-            <ExternalLink size={13} />
-            <span>用系统应用打开</span>
-          </button>
-          <button type="button" onClick={() => { const p = fileMenu.path; setFileMenu(null); void api.revealPath(p, room) }}>
-            <FolderSearch size={13} />
-            <span>在访达中显示</span>
-          </button>
+          {fileMenu.path && (
+            <>
+              <button type="button" onClick={() => copyAbsPath(fileMenu.path)}>
+                <Copy size={13} />
+                <span>复制绝对路径</span>
+              </button>
+              {fileMenu.allowPreview && (
+                // The side panel sits under the lightbox, so leave the lightbox first.
+                <button type="button" onClick={() => { const p = fileMenu.path; setFileMenu(null); setLightbox(null); void handlePreviewFile(p) }}>
+                  <Eye size={13} />
+                  <span>在右侧预览</span>
+                </button>
+              )}
+              <button type="button" onClick={() => { const p = fileMenu.path; setFileMenu(null); void api.openPath(p, room) }}>
+                <ExternalLink size={13} />
+                <span>用系统应用打开</span>
+              </button>
+              <button type="button" onClick={() => { const p = fileMenu.path; setFileMenu(null); void api.revealPath(p, room) }}>
+                <FolderSearch size={13} />
+                <span>在访达中显示</span>
+              </button>
+            </>
+          )}
         </div>
       )}
 

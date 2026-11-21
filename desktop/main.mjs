@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, nativeTheme, net, protocol, session, shell } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage, nativeTheme, net, protocol, session, shell } from 'electron'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
@@ -500,6 +500,16 @@ else app.whenReady().then(async () => {
     const resolved = resolveLocalFilePath(row?.dir || '', targetPath)
     if (!resolved || !existsSync(resolved)) return false
     shell.showItemInFolder(resolved)
+    return true
+  })
+  // The renderer normalises every format (svg, webp, gif…) to PNG first; the system clipboard
+  // then gets a real image that pastes into any app, not a data URL string.
+  handle('copyImage', pngDataUrl => {
+    const raw = String(pngDataUrl || '')
+    if (!raw.startsWith('data:image/png;base64,') || raw.length > 80 * 1024 * 1024) throw Error('无法复制该图片')
+    const img = nativeImage.createFromDataURL(raw)
+    if (img.isEmpty()) throw Error('无法复制该图片')
+    clipboard.writeImage(img)
     return true
   })
   handle('respondInteraction', req => {
