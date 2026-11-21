@@ -1,8 +1,12 @@
 import React, { useMemo, useRef, useState } from 'react'
 import Markdown, { defaultUrlTransform, type Components } from 'react-markdown'
 import gfm from 'remark-gfm'
+import remarkMath from 'remark-math'
+import rehypeKatex from 'rehype-katex'
+import 'katex/dist/katex.min.css'
 import { Check, Copy, ExternalLink, FileText } from 'lucide-react'
 import { LocalImageThumb, type LightboxImageItem } from './ImageLightbox'
+import { preprocessMathDelimiters } from './markdownMath'
 
 const TOKEN_RE = /(\/\/.*$|#.*$|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\b(?:const|let|var|function|return|if|else|for|while|switch|case|break|continue|import|export|from|default|async|await|try|catch|finally|throw|new|class|extends|implements|interface|type|enum|def|elif|pass|with|as|in|not|and|or|is|None|True|False|true|false|null|undefined|pub|fn|struct|impl|use|mod|match|SELECT|FROM|WHERE|INSERT|INTO|VALUES|UPDATE|SET|DELETE|CREATE|TABLE|JOIN|ON|ORDER|BY|LIMIT|PRAGMA)\b|\b\d+(?:\.\d+)?\b)/gm
 
@@ -115,7 +119,8 @@ function preprocessCitations(md: string): string {
   return out
 }
 
-const REMARK_PLUGINS = [gfm]
+const REMARK_PLUGINS: React.ComponentProps<typeof Markdown>['remarkPlugins'] = [gfm, remarkMath]
+const REHYPE_PLUGINS: React.ComponentProps<typeof Markdown>['rehypePlugins'] = [[rehypeKatex, { throwOnError: false, strict: false }]]
 const urlTransform = (url: string) =>
   (url.startsWith('omini-cite://') || url.startsWith('omini-mem://') || /^file:\/\//i.test(url)) ? url : defaultUrlTransform(url)
 
@@ -134,7 +139,7 @@ export const MarkdownView = React.memo(function MarkdownView({
   onOpenLightbox?: (items: LightboxImageItem[], index: number) => void
   onFileContextMenu?: (e: React.MouseEvent, absPath: string, allowPreview?: boolean) => void
 }) {
-  const processed = useMemo(() => preprocessCitations(content), [content])
+  const processed = useMemo(() => preprocessMathDelimiters(preprocessCitations(content)), [content])
   // react-markdown treats each `components` entry as an element type. Recreating them on
   // every render (i.e. every streamed delta) remounted code blocks and thumbnails, so keep
   // them stable and read the latest callbacks through a ref.
@@ -277,6 +282,7 @@ export const MarkdownView = React.memo(function MarkdownView({
     <div className="markdown">
       <Markdown
         remarkPlugins={REMARK_PLUGINS}
+        rehypePlugins={REHYPE_PLUGINS}
         urlTransform={urlTransform}
         components={components}
       >

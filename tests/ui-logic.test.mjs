@@ -3,6 +3,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { parseStepsWithMeta, buildTimelineSegments, summarizeStepGroup, fenceSafeCut, extractStepImages } from '../src/steps.ts'
 import { cleanError } from '../src/errors.ts'
+import { preprocessMathDelimiters } from '../src/markdownMath.ts'
 
 const step = o => '::step::' + JSON.stringify(o)
 
@@ -236,4 +237,52 @@ test('a failed queued dispatch is kept at the head and pauses the room until ret
   state = prioritizeItem(state, state.r1[0])
   assert.equal(state.r1[0].error, undefined)
   assert.deepEqual(drainableHeads(state, [], new Set()).map(x => x.id), ['a'])
+})
+
+test('preprocessMathDelimiters converts LaTeX brackets outside code blocks and inline code', () => {
+  const input = [
+    '行内 \\(1/(N+1)\\) 与行内代码 `\\(keep\\)`',
+    '\\[\\lfloor N/2 \\rfloor + 1\\]',
+    '```tex',
+    '\\(inside fence\\)',
+    '```'
+  ].join('\n')
+  const out = preprocessMathDelimiters(input)
+  assert.equal(out, [
+    '行内 $1/(N+1)$ 与行内代码 `\\(keep\\)`',
+    '$$\\lfloor N/2 \\rfloor + 1$$',
+    '```tex',
+    '\\(inside fence\\)',
+    '```'
+  ].join('\n'))
+})
+
+test('markdown math pipeline renders inline and block LaTeX formulas via KaTeX without breaking inline code', async () => {
+  const React = (await import('react')).default
+  const { renderToStaticMarkup } = await import('react-dom/server')
+  const Markdown = (await import('react-markdown')).default
+  const gfm = (await import('remark-gfm')).default
+  const remarkMath = (await import('remark-math')).default
+  const rehypeKatex = (await import('rehype-katex')).default
+
+  const render = md => renderToStaticMarkup(React.createElement(Markdown, {
+    remarkPlugins: [gfm, remarkMath],
+    rehypePlugins: [[rehypeKatex, { throwOnError: false, strict: false }]]
+  }, preprocessMathDelimiters(md)))
+
+  const inline1 = render('迁移约 $1/(N+1)$）与热点治理')
+  assert.match(inline1, /class="katex"/)
+  assert.doesNotMatch(inline1, /\$1\/\(N\+1\)\$/)
+
+  const inline2 = render('多数派提交（$\\lfloor N/2 \\rfloor + 1$），只讲原理')
+  assert.match(inline2, /class="katex"/)
+  assert.match(inline2, /<span class="mopen">⌊<\/span>/)
+  assert.doesNotMatch(inline2, /\$\\lfloor/)
+
+  const latexParen = render('复杂度为 \\(O(\\log N)\\)')
+  assert.match(latexParen, /class="katex"/)
+
+  const inlineCode = render('保留行内代码 `$1/(N+1)$` 与 `report.docx`')
+  assert.doesNotMatch(inlineCode, /class="katex"/)
+  assert.match(inlineCode, /<code>\$1\/\(N\+1\)\$<\/code>/)
 })
