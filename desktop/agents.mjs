@@ -8,6 +8,7 @@ import { createInterface } from 'node:readline'
 
 import {names,dirs,binary,initClients} from './clients.mjs'
 import {desktopApp,runDesktopTurn} from './antigravity-desktop.mjs'
+import {ensureCodexProject,syncCodexProjectStandalone,setCodexThreadNameStandalone} from './codex-projects.mjs'
 import {antigravityEnv} from './antigravity-env.mjs'
 import {resolveProviderConfig,prepareCodexHome,legacyCodexRollout} from './ccswitch.mjs'
 import {EFFORT_LEVELS,isValidEffort,normalizeModelEfforts,applyReasoningEffort} from './reasoning.mjs'
@@ -285,7 +286,30 @@ function claudeConfig(env,args,model,provider=null) {
   return role
 }
 
-export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],session,write=false,access='',signal,emit,model='',effort='',providerId='',catalogOnly=false}) {
+export async function syncCodexProject(cwd, projectName = '') {
+  try {
+    await initClients()
+    const exe = binary('Codex')
+    if (!exe) return null
+    const env = { ...process.env, PATH: dirs.join(':') }
+    return await syncCodexProjectStandalone({ exe, cwd, projectName, env })
+  } catch {
+    return null
+  }
+}
+
+export async function setCodexThreadName(threadId, name) {
+  try {
+    await initClients()
+    const exe = binary('Codex')
+    if (!exe) return false
+    return await setCodexThreadNameStandalone({ exe, threadId, name, env: { ...process.env, PATH: dirs.join(':') } })
+  } catch {
+    return false
+  }
+}
+
+export async function execute({agent,cwd,projectName='',prompt,historyPrompt,title,titleLocked=false,images=[],session,write=false,access='',signal,emit,model='',effort='',providerId='',catalogOnly=false}) {
   const accessMode = (access === 'read-only' || access === 'workspace' || access === 'full') ? access : (write ? 'workspace' : 'read-only')
   write = accessMode !== 'read-only'
   await initClients()
@@ -297,7 +321,7 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
   if (providerId && !provider) throw Error('渠道配置已变化，请重新选择。')
   const gravityApp = agent === 'Antigravity' && !provider && desktopApp()
   if (gravityApp) {
-    return runDesktopTurn({app:gravityApp,cwd,prompt,historyPrompt,title,session,images,write,model,effort,signal,emit})
+    return runDesktopTurn({app:gravityApp,cwd,projectName,prompt,historyPrompt,title,titleLocked,session,images,write,model,effort,signal,emit})
   }
   if (agent === 'Antigravity') emit('log', provider ? '当前渠道使用独立 CLI 会话。' : '未安装 Antigravity 桌面端，使用本机 CLI 会话。')
   const env={...process.env, PATH:dirs.join(':')}
@@ -788,6 +812,10 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
         emitStep({id:'reason-'+rid,kind:'thought',title:'思考中',status:'running',detail:next.slice(-1800)})
       }
     }
+    if(e.method==='thread/name/updated' && !isSubThread){
+      const nextName=String(p?.threadName||'').trim()
+      if(nextName)emit('title',nextName)
+    }
     if(e.method==='item/agentMessage/delta'){
       if(isSubThread)return
       if(currentItem!==p.itemId){if(output)append('\n\n');currentItem=p.itemId;deltas=''}
@@ -879,7 +907,7 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
       return
     }
     if(codex){
-      await request('initialize',{clientInfo:{name:'ominihive',title:'OminiHive',version:'0.1.0'},capabilities:{experimentalApi:false}})
+      await request('initialize',{clientInfo:{name:'ominihive',title:'OminiHive',version:'0.1.0'},capabilities:{experimentalApi:true}})
       send({method:'initialized',params:{}})
       const catalog=await request('model/list',{})
       if(catalogOnly)return catalog.data.map(m=>({id:m.model,label:m.displayName||m.model,isDefault:m.isDefault,defaultEffort:m.defaultReasoningEffort,efforts:m.supportedReasoningEfforts.map(e=>e.reasoningEffort)}))
@@ -887,6 +915,8 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
       const defaultModel=model||catalog.data.find(m=>m.isDefault)?.model
       if(effort&&!catalog.data.find(m=>m.model===defaultModel)?.supportedReasoningEfforts.some(e=>e.reasoningEffort===effort))throw Error('当前模型不支持此强度')
       const turnEffort=effort||catalog.data.find(m=>m.model===defaultModel)?.defaultReasoningEffort
+      const codexProject=await ensureCodexProject(request,cwd,projectName).catch(()=>null)
+      const codexProjectId=codexProject?.projectId||''
       const codexSandbox=accessMode==='full'?'danger-full-access':(accessMode==='workspace'?'workspace-write':'read-only')
       const opts={cwd,...(defaultModel?{model:defaultModel}:{}),sandbox:codexSandbox,approvalPolicy:'never'}
       const resumeCodex=async params=>{
@@ -913,10 +943,14 @@ export async function execute({agent,cwd,prompt,historyPrompt,title,images=[],se
           if(!rollout)throw e
           result=await resumeCodex({...opts,threadId:session,path:rollout})
         }
-      }else result=await request('thread/start',opts)
+      }else result=await request('thread/start',{...opts,...(codexProjectId?{projectId:codexProjectId}:{})})
       if(result.model)emit('log','模型 · '+result.model)
       const id=result.thread.id;codexThreadId=id;emit('session',id);active=true
-      if(title && result.thread.name !== title) await request('thread/name/set',{threadId:id,name:title}).catch(()=>emit('log','Codex 未能更新会话标题，原生会话已保存。'))
+      // Only bind threads that have no project yet, so a thread the user moved in Codex App stays where they put it.
+      if(codexProjectId && !result.thread?.projectId){
+        await request('thread/metadata/update',{threadId:id,projectId:codexProjectId}).catch(()=>{})
+      }
+      if(titleLocked && title && result.thread.name !== title) await request('thread/name/set',{threadId:id,name:title}).catch(()=>emit('log','Codex 未能更新会话标题，原生会话已保存。'))
       const sandboxPolicy=accessMode==='full'
         ? {type:'dangerFullAccess'}
         : (accessMode==='workspace'

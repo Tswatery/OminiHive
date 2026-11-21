@@ -28,11 +28,12 @@ import { loadJson } from './storage'
 import { useAgentPrefs, type AgentPrefs } from './useAgentPrefs'
 import { useSendQueue, type QueuedMessage } from './useSendQueue'
 import { SendQueueBar } from './SendQueueBar'
+import { TypewriterTitle, isAutoTitle } from './TypewriterTitle'
 import './tokens.css'
 import './style.css'
 
 type Project = { id: string; name: string; dir: string }
-type Room = { id: string; project: string; title: string }
+type Room = { id: string; project: string; title: string; title_locked?: number; title_auto?: number }
 type Msg = { id: string; author: string; body: string; log: string; status: string; time: number; duration?: number; attachments?: string }
 type ImageDraft = { id: string; name: string; dataUrl: string; isImage: boolean }
 type RunningJob = { room: string; agent: Agent }
@@ -1700,7 +1701,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
                                   onClick={() => setRoom(r.id)}
                                 >
                                   <MessageSquare size={13} />
-                                  <span>{r.title}</span>
+                                  <TypewriterTitle text={r.title} animate={isAutoTitle(r)} />
                                   <AgentStatusDots running={roomJobs.map(j => j.agent)} done={roomDoneAgents} justDone={roomJustDone} />
                                 </button>
                                 <div className="row-actions">

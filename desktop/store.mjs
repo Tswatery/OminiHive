@@ -137,6 +137,8 @@ export class Store {
     try { this.db.exec("ALTER TABLE messages ADD COLUMN attachments TEXT DEFAULT ''") } catch {}
     try { this.db.exec('ALTER TABLE sessions ADD COLUMN last_seen_rowid INTEGER DEFAULT 0') } catch {}
     try { this.db.exec('ALTER TABLE rooms ADD COLUMN title_locked INTEGER DEFAULT 0') } catch {}
+    // 0 = derived from the first message, 1 = synced from a native client, 2 = AI-generated summary.
+    try { this.db.exec('ALTER TABLE rooms ADD COLUMN title_auto INTEGER DEFAULT 0') } catch {}
   }
   stmt(sql) {
     let st = this.stmts.get(sql)
@@ -184,14 +186,22 @@ export class Store {
     this.run('UPDATE rooms SET title=?, title_locked=1 WHERE id=?', clean, id)
   }
 
-  autoTitleRoom(id, title) {
+  autoTitleRoom(id, title, source = 1) {
     const clean = String(title || '').trim().slice(0, 60)
     if (!clean) return false
-    const row = this.get('SELECT title, title_locked FROM rooms WHERE id=?', id)
+    const row = this.get('SELECT title, title_locked, COALESCE(title_auto,0) AS title_auto FROM rooms WHERE id=?', id)
     if (!row || row.title_locked) return false
-    if (row.title === clean) return false
-    this.run('UPDATE rooms SET title=? WHERE id=?', clean, id)
+    const level = Math.max(Number(row.title_auto) || 0, source)
+    if (row.title === clean) {
+      if (level !== row.title_auto) this.run('UPDATE rooms SET title_auto=? WHERE id=?', level, id)
+      return false
+    }
+    this.run('UPDATE rooms SET title=?, title_auto=? WHERE id=?', clean, level, id)
     return true
+  }
+
+  roomTitleState(id) {
+    return this.get('SELECT r.title, COALESCE(r.title_locked,0) AS title_locked, COALESCE(r.title_auto,0) AS title_auto, p.dir, p.name FROM rooms r JOIN projects p ON p.id=r.project WHERE r.id=?', id) || null
   }
 
   importRoom(projectId, { agent, nativeId, title, turns = [] }) {
@@ -202,7 +212,8 @@ export class Store {
     const now = Date.now()
     this.db.exec('BEGIN')
     try {
-      this.run('INSERT INTO rooms(id,project,title,title_locked) VALUES(?,?,?,0)', roomId, projectId, cleanTitle)
+      // Imported sessions already carry the native client's title; don't regenerate it.
+      this.run('INSERT INTO rooms(id,project,title,title_locked,title_auto) VALUES(?,?,?,0,?)', roomId, projectId, cleanTitle, String(title || '').trim() ? 1 : 0)
       const insertedIds = []
       for (let i = 0; i < turns.length; i++) {
         const t = turns[i]
@@ -269,7 +280,7 @@ export class Store {
   }
 
   syncArchive(room) {
-    const project = this.get('SELECT p.dir FROM projects p JOIN rooms r ON p.id=r.project WHERE r.id=?', room)
+    const project = this.get('SELECT p.dir, p.name FROM projects p JOIN rooms r ON p.id=r.project WHERE r.id=?', room)
     if (!project) return new Map()
     const allMsgs = this.messages(room)
     return syncRoomArchive(project.dir, room, allMsgs)
@@ -409,7 +420,7 @@ export class Store {
     const parsed = routeTargets(text, fallbackAgents)
     const agents = Array.isArray(explicitAgents) && explicitAgents.length ? explicitAgents : parsed.agents
     const task = parsed.task
-    const project = this.get('SELECT p.dir FROM projects p JOIN rooms r ON p.id=r.project WHERE r.id=?', room)
+    const project = this.get('SELECT p.dir, p.name FROM projects p JOIN rooms r ON p.id=r.project WHERE r.id=?', room)
     if (!project || canonical(project.dir) !== project.dir) throw Error('项目目录已变化，请重新选择')
     const hasMention = new RegExp(`(?:^|\\s)@(?:${AGENT_PATTERN}|all)(?=\\s|$|[，。,.!?！？])`, 'i').test(text)
     const prefix = parsed.isAll ? '@all' : '@' + agents.join(' @')
@@ -445,7 +456,9 @@ export class Store {
       const userMsgId = randomUUID()
       const userInsert = this.run('INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?)', userMsgId, room, '我', displayText, '', '完成', now, 0, attJson)
       const seenRowid = Number(userInsert.lastInsertRowid) || 0
-      const {title} = this.get('SELECT title FROM rooms WHERE id=?', room)
+      const roomMeta = this.get('SELECT title, COALESCE(title_locked, 0) AS title_locked FROM rooms WHERE id=?', room)
+      const title = roomMeta?.title || ''
+      const titleLocked = Boolean(roomMeta?.title_locked)
       for (let i = 0; i < agents.length; i++) {
         const agent = agents[i]
         const id = randomUUID()
@@ -468,9 +481,11 @@ export class Store {
           agent,
           session,
           cwd: project.dir,
+          projectName: project.name,
           prompt,
           historyPrompt,
           title,
+          titleLocked,
           sessionKey: sessionKeys[agent] || agent,
           seenRowid,
           deliveredIds: [...sentMsgIds, userMsgId]

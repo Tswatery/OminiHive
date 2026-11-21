@@ -1,5 +1,6 @@
 import React from 'react'
 import { ChevronRight, Download, FolderTree, PanelLeft, RefreshCw, SquarePen } from 'lucide-react'
+import { TypewriterTitle, isAutoTitle } from './TypewriterTitle'
 
 export type ChatHeaderProps = {
   collapsed: boolean
@@ -7,7 +8,7 @@ export type ChatHeaderProps = {
   /** Shown only while the sidebar is collapsed, since the sidebar owns the "new room" entry otherwise. */
   onNewRoom: () => void
   project: { id: string; name: string; dir: string } | null
-  currentRoom: { id: string; project: string; title: string } | null
+  currentRoom: { id: string; project: string; title: string; title_locked?: number; title_auto?: number } | null
   onOpenProjectDir: (dir: string) => void
   /** Slot for the room-members picker (kept outside so the header doesn't forward its props). */
   members?: React.ReactNode
@@ -54,7 +55,7 @@ export function ChatHeader({
             </span>
             <ChevronRight size={13} className="head-sep" />
             {currentRoom && (
-              <strong>{currentRoom.title}</strong>
+              <strong><TypewriterTitle key={currentRoom.id} text={currentRoom.title} animate={isAutoTitle(currentRoom)} /></strong>
             )}
           </>
         ) : (

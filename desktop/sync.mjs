@@ -4,6 +4,7 @@ import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { listDesktopSessions, readDesktopHistory, readDesktopTitle } from './antigravity-desktop.mjs'
 import { PROMPT_TASK_MARKER, PROMPT_TASK_OPEN, PROMPT_TASK_CLOSE, summarizeTitle } from './store.mjs'
+import { looksLikeSmartTitle } from './auto-title.mjs'
 
 function normalizeText(raw) {
   let s = String(raw || '').trim()
@@ -145,7 +146,7 @@ function parseCodexRollout(filePath) {
   return mergeConsecutiveAssistantTurns(eventTurns.length ? eventTurns : itemTurns)
 }
 
-function findClaudeTranscript(sessionId, cwd) {
+export function findClaudeTranscript(sessionId, cwd) {
   if (!sessionId) return null
   const projectsDir = path.join(homedir(), '.claude', 'projects')
   if (!existsSync(projectsDir)) return null
@@ -202,13 +203,8 @@ function readCodexTitle(threadId) {
   try {
     db = new DatabaseSync(dbPath, { readOnly: true })
     const row = db.prepare('SELECT name, title FROM threads WHERE id=?').get(threadId)
-    const name = typeof row?.name === 'string' ? row.name.trim() : ''
-    if (name) return name
-    const title = typeof row?.title === 'string' ? row.title.trim() : ''
-    if (title && !title.includes('\n') && title.length <= 40 && !title.includes('<group_context>') && !title.includes('<user_task>')) {
-      return title
-    }
-    return ''
+    // Only an explicit thread name counts; `title` is just the first-message preview.
+    return typeof row?.name === 'string' ? row.name.trim() : ''
   } catch {
     return ''
   } finally {
@@ -221,19 +217,18 @@ function readClaudeTitle(sessionId, cwd) {
   if (!filePath) return ''
   let raw = ''
   try { raw = readFileSync(filePath, 'utf8') } catch { return '' }
-  let best = ''
+  // Latest of each kind wins; a user-set custom title beats the AI title, which beats a summary.
+  let custom = '', ai = '', summary = ''
   for (const line of raw.split('\n')) {
-    if (!line.trim()) continue
-    if (!line.includes('custom-title') && !line.includes('"summary"')) continue
+    if (!line.includes('-title"') && !line.includes('"summary"')) continue
     let rec
     try { rec = JSON.parse(line) } catch { continue }
-    if (rec.type === 'custom-title' && typeof rec.customTitle === 'string' && rec.customTitle.trim()) {
-      best = rec.customTitle.trim()
-    } else if (rec.type === 'summary' && typeof rec.summary === 'string' && rec.summary.trim()) {
-      best = rec.summary.trim()
-    }
+    const pick = v => typeof v === 'string' ? v.trim() : ''
+    if (rec.type === 'custom-title' && pick(rec.customTitle)) custom = pick(rec.customTitle)
+    else if (rec.type === 'ai-title' && pick(rec.aiTitle)) ai = pick(rec.aiTitle)
+    else if (rec.type === 'summary' && pick(rec.summary)) summary = pick(rec.summary)
   }
-  return best
+  return custom || ai || summary
 }
 
 function safeRealpath(p) {
@@ -355,6 +350,7 @@ export async function syncRoomExternal(store, roomId, busyAgents = new Set()) {
   const cwd = projectRow?.dir || ''
 
   const existing = store.messages(roomId)
+  const firstUserBody = existing.find(m => m.author === '我')?.body || ''
   const knownFingerprints = new Set()
   const knownNormTexts = new Set()
   const knownAssistantBodies = []
@@ -395,7 +391,8 @@ export async function syncRoomExternal(store, roomId, busyAgents = new Set()) {
       if (agent === 'Antigravity') extTitle = await readDesktopTitle(nativeId).catch(() => '')
       else if (agent === 'Codex') extTitle = readCodexTitle(nativeId)
       else if (agent === 'Claude') extTitle = readClaudeTitle(nativeId, cwd)
-      if (extTitle && extTitle.length >= 2 && extTitle.length <= 52 && !extTitle.includes('<group_context>') && !extTitle.includes('<user_task>')) {
+      // Titles that merely echo the first message (older OminiHive builds wrote those) aren't smart titles.
+      if (extTitle && extTitle.length <= 52 && looksLikeSmartTitle(extTitle, firstUserBody)) {
         if (store.autoTitleRoom(roomId, extTitle)) {
           titleUpdated = true
           addedCount++

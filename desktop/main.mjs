@@ -7,12 +7,13 @@ import path from 'node:path'
 import { createQuotaClient } from './volc-quota.mjs'
 import { createCatalog } from './catalog.mjs'
 import { Store, routeTargets } from './store.mjs'
-import { execute, availability, respondAgentInteraction, killAllAgentProcesses } from './agents.mjs'
-import { respondDesktopInteraction, focusDesktopApp, cancelDesktopBackground } from './antigravity-desktop.mjs'
-import { initClients, inventory, updates, upgrade, isUpgrading } from './clients.mjs'
+import { execute, availability, respondAgentInteraction, killAllAgentProcesses, syncCodexProject, setCodexThreadName } from './agents.mjs'
+import { respondDesktopInteraction, focusDesktopApp, cancelDesktopBackground, ensureDesktopProject, readDesktopTitle, setDesktopTitle } from './antigravity-desktop.mjs'
+import { initClients, inventory, updates, upgrade, isUpgrading, binary, dirs } from './clients.mjs'
 import { ccSwitchSummary } from './ccswitch.mjs'
 import { listFiles, previewFile, listAgentSkills, resolveLocalFilePath, getGitStatus, opensAsProgram } from './workspace.mjs'
-import { syncRoomExternal, listExternalSessions, loadExternalSessionTurns } from './sync.mjs'
+import { syncRoomExternal, listExternalSessions, loadExternalSessionTurns, findClaudeTranscript } from './sync.mjs'
+import { generateTitleWithCodex, looksLikeSmartTitle, appendClaudeTitle } from './auto-title.mjs'
 
 app.setName('OminiHive')
 protocol.registerSchemesAsPrivileged([
@@ -79,6 +80,75 @@ async function syncRoom(roomId, { force = false } = {}) {
     .finally(() => syncInflight.delete(roomId))
   syncInflight.set(roomId, p)
   return p
+}
+
+function syncExternalProjects(cwd, projectName = '') {
+  if (!cwd) return
+  void syncCodexProject(cwd, projectName).catch(() => null)
+  void ensureDesktopProject({ cwd, projectName }).catch(() => null)
+}
+
+// Pushes a room title into every native client session bound to the room.
+async function writeBackTitle(roomId, title, { custom = false, skipAgents = [] } = {}) {
+  const st = store.roomTitleState(roomId)
+  if (!st || !title) return
+  const busy = new Set(allRunning().filter(j => j.room === roomId).map(j => j.agent))
+  await Promise.all(store.listSessions(roomId).map(async ({ agent, native }) => {
+    if (!native || skipAgents.includes(agent)) return
+    try {
+      // Provider-specific sessions live in separate homes or CLIs that native clients don't show.
+      if (agent === 'Codex') await setCodexThreadName(native, title)
+      else if (agent === 'Antigravity') await setDesktopTitle(native, title)
+      else if (agent.split(':')[0] === 'Claude' && !busy.has('Claude')) {
+        appendClaudeTitle(findClaudeTranscript(native, st.dir), native, title, { custom })
+      }
+    } catch {}
+  }))
+}
+
+const autoNaming = new Set()
+
+// After the first completed turn, replace the "first words of the message" title with a summary.
+// Antigravity names its own conversations, so when it took part its title wins; otherwise Codex generates one.
+async function autoNameRoom(roomId) {
+  if (!store || autoNaming.has(roomId)) return
+  const st = store.roomTitleState(roomId)
+  if (!st || st.title_locked || st.title_auto > 0) return
+  const first = store.get("SELECT body FROM messages WHERE room=? AND author='我' ORDER BY time, rowid LIMIT 1", roomId)
+  const reply = store.get("SELECT body FROM messages WHERE room=? AND author<>'我' AND status='完成' AND body<>'' ORDER BY time, rowid LIMIT 1", roomId)
+  if (!first?.body || !reply?.body) return
+  autoNaming.add(roomId)
+  try {
+    const ag = store.listSessions(roomId).find(s => s.agent === 'Antigravity' && s.native)
+    if (ag) {
+      for (let i = 0; i < 12; i++) {
+        const now = store.roomTitleState(roomId)
+        if (!now || now.title_locked) return
+        if (now.title_auto > 0) {
+          await writeBackTitle(roomId, now.title, { skipAgents: ['Antigravity'] })
+          return
+        }
+        const t = String(await readDesktopTitle(ag.native).catch(() => '') || '').trim()
+        if (looksLikeSmartTitle(t, first.body)) {
+          if (store.autoTitleRoom(roomId, t, 1)) changed()
+          await writeBackTitle(roomId, t, { skipAgents: ['Antigravity'] })
+          return
+        }
+        await new Promise(r => setTimeout(r, 2000))
+      }
+    }
+    await initClients()
+    const exe = binary('Codex')
+    if (!exe) return
+    const title = await generateTitleWithCodex({ exe, env: { ...process.env, PATH: dirs.join(':') }, task: first.body, reply: reply.body })
+    if (!title) return
+    const now = store.roomTitleState(roomId)
+    if (!now || now.title_locked || now.title_auto > 0) return
+    if (store.autoTitleRoom(roomId, title, 2)) changed()
+    await writeBackTitle(roomId, title)
+  } catch {} finally {
+    autoNaming.delete(roomId)
+  }
 }
 
 function changed() {
@@ -217,6 +287,11 @@ async function run(room, text, allowWrite, modelOrPrefs = '', effort = '', targe
         signal: controller.signal,
         emit(type, value) {
           if (stoppedMsgIds.has(item.id)) return
+          if (type === 'title') {
+            const clean = String(value || '').trim()
+            if (clean && store.autoTitleRoom(room, clean)) changed()
+            return
+          }
           if (type === 'session' && item.agent === 'Antigravity') cascadeId = String(value || '')
           if (type === 'status') {
             if (value === '执行中') {
@@ -225,6 +300,8 @@ async function run(room, text, allowWrite, modelOrPrefs = '', effort = '', targe
             } else {
               if (bgRunning.get(key)?.msgId === item.id) bgRunning.delete(key)
               store.finish(item.id, String(value || '完成'))
+              // Background desktop turns finish after run() returned; name the room once they do.
+              void autoNameRoom(room)
             }
             changed()
             return
@@ -249,6 +326,7 @@ async function run(room, text, allowWrite, modelOrPrefs = '', effort = '', targe
       changed()
     }
   }))
+  void autoNameRoom(room)
 }
 
 function openWindow() {
@@ -308,11 +386,26 @@ else app.whenReady().then(async () => {
   handle('syncRoom', room => syncRoom(room, { force: true }))
   handle('add', async () => {
     const r = await dialog.showOpenDialog(win, { title: '选择本地项目', properties: ['openDirectory'] })
-    return r.canceled ? null : store.project(r.filePaths[0])
+    if (r.canceled) return null
+    const id = store.project(r.filePaths[0])
+    const proj = store.get('SELECT dir, name FROM projects WHERE id=?', id)
+    if (proj?.dir) syncExternalProjects(proj.dir, proj.name)
+    return id
   })
+  // Projects are synced when a folder is added and on every Codex/Antigravity turn; not per new room.
   handle('room', id => store.room(id))
-  handle('renameProject', (id, name) => { store.renameProject(id, name); changed() })
-  handle('renameRoom', (id, title) => { store.renameRoom(id, title); changed() })
+  handle('renameProject', (id, name) => {
+    store.renameProject(id, name)
+    const proj = store.get('SELECT dir, name FROM projects WHERE id=?', id)
+    if (proj?.dir) syncExternalProjects(proj.dir, proj.name)
+    changed()
+  })
+  handle('renameRoom', (id, title) => {
+    store.renameRoom(id, title)
+    changed()
+    const st = store.roomTitleState(id)
+    if (st?.title) void writeBackTitle(id, st.title, { custom: true })
+  })
   handle('externalSessions', async projectId => {
     const proj = store.get('SELECT dir FROM projects WHERE id=?', projectId)
     return listExternalSessions(proj?.dir || '')

@@ -4912,3 +4912,60 @@ main {
   color: rgba(255, 255, 255, 0.78);
   font-size: 13px;
 }
+
+/* Automatic room rename: backspace the old title, type the new one, then a light sweep. */
+.tw-title {
+  min-width: 0;
+}
+
+.tw-title .tw-ch {
+  font-style: normal;
+  display: inline;
+  animation: tw-char-in 240ms ease-out both;
+}
+
+.tw-title .tw-caret {
+  display: inline-block;
+  width: 1.5px;
+  height: 1.05em;
+  margin-left: 1px;
+  vertical-align: -0.14em;
+  border-radius: 1px;
+  background: var(--accent);
+  animation: tw-caret-blink 0.9s steps(1) infinite;
+}
+
+.tw-title.tw-busy {
+  text-overflow: clip;
+}
+
+.tw-title.tw-glow {
+  background: linear-gradient(100deg, currentColor 0%, currentColor 38%, var(--accent) 50%, currentColor 62%, currentColor 100%);
+  background-size: 260% 100%;
+  background-position: 100% 0;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: tw-sweep 1.25s ease-in-out both;
+}
+
+@keyframes tw-char-in {
+  from { opacity: 0; filter: blur(3px); color: var(--accent); }
+  60% { opacity: 1; filter: blur(0); color: var(--accent); }
+  to { opacity: 1; filter: blur(0); }
+}
+
+@keyframes tw-caret-blink {
+  0%, 55% { opacity: 1; }
+  56%, 100% { opacity: 0; }
+}
+
+@keyframes tw-sweep {
+  from { background-position: 100% 0; }
+  to { background-position: 0% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tw-title .tw-ch, .tw-title .tw-caret, .tw-title.tw-glow { animation: none; }
+  .tw-title.tw-glow { -webkit-text-fill-color: currentColor; background: none; }
+}

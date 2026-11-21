@@ -394,10 +394,11 @@ async function normalizeFolder(raw) {
   return realpath(resolved).catch(() => resolved)
 }
 
-async function ensureProject(rpc, cwd, preferred) {
+async function ensureProject(rpc, cwd, preferred, projectName = '') {
   const normCwd = await normalizeFolder(cwd)
   const uri = pathToFileURL(normCwd || cwd).href
   const baseName = path.basename(normCwd || cwd)
+  const targetName = String(projectName || '').trim() || baseName
   const {projectIds = []} = await rpc('ListProjects', {})
   const {projects = [], failedIds = []} = projectIds.length ? await rpc('ReadProjects', {ids:projectIds}) : {}
   if (failedIds.length) throw Error('Antigravity 未能读取项目列表，请稍后重试。')
@@ -408,6 +409,7 @@ async function ensureProject(rpc, cwd, preferred) {
     if (project?.name) usedNames.add(String(project.name).trim().toLowerCase())
     if (project.archived || project.sidecar) continue
     let folderMatched = false
+    let hasOtherFolder = false
     for (const resource of project.projectResources?.resources || []) {
       const rawUri = resource?.folderUri || resource?.workspaceUri || resource?.uri || resource?.path || ''
       if (!rawUri) continue
@@ -417,8 +419,9 @@ async function ensureProject(rpc, cwd, preferred) {
         folderMatched = true
         break
       }
+      if (resPath) hasOtherFolder = true
     }
-    if (!folderMatched && project.name && String(project.name).trim().toLowerCase() === baseName.toLowerCase()) {
+    if (!folderMatched && !hasOtherFolder && project.name && String(project.name).trim().toLowerCase() === targetName.toLowerCase()) {
       nameMatches.push(project.id)
     }
   }
@@ -428,15 +431,15 @@ async function ensureProject(rpc, cwd, preferred) {
   if (nameMatches.includes(preferred)) return preferred
   if (nameMatches.length === 1) return nameMatches[0]
 
-  let candidateName = baseName
+  let candidateName = targetName
   if (usedNames.has(candidateName.toLowerCase())) {
     const parent = path.basename(path.dirname(normCwd || cwd))
-    if (parent && !usedNames.has(`${baseName} (${parent})`.toLowerCase())) {
-      candidateName = `${baseName} (${parent})`
+    if (parent && !usedNames.has(`${targetName} (${parent})`.toLowerCase())) {
+      candidateName = `${targetName} (${parent})`
     } else {
       let n = 2
-      while (usedNames.has(`${baseName} (${n})`.toLowerCase())) n++
-      candidateName = `${baseName} (${n})`
+      while (usedNames.has(`${targetName} (${n})`.toLowerCase())) n++
+      candidateName = `${targetName} (${n})`
     }
   }
   const id = randomUUID()
@@ -446,7 +449,7 @@ async function ensureProject(rpc, cwd, preferred) {
   } catch (err) {
     const msg = String(err?.message || '')
     if (/already_exists|already exists/i.test(msg)) {
-      const fallbackName = `${baseName}-${id.slice(0, 6)}`
+      const fallbackName = `${targetName}-${id.slice(0, 6)}`
       await rpc('CreateProject', {project:{id, name:fallbackName, projectResources:{resources:[{folderUri:uri}]}}})
       return id
     }
@@ -454,10 +457,21 @@ async function ensureProject(rpc, cwd, preferred) {
   }
 }
 
-function projectFor(rpc, cwd, preferred) {
+function projectFor(rpc, cwd, preferred, projectName = '') {
   // Coalesce first-use creation when multiple rooms use a newly added folder.
-  if (!projectRequests.has(cwd)) projectRequests.set(cwd, ensureProject(rpc, cwd, preferred).finally(() => projectRequests.delete(cwd)))
+  if (!projectRequests.has(cwd)) projectRequests.set(cwd, ensureProject(rpc, cwd, preferred, projectName).finally(() => projectRequests.delete(cwd)))
   return projectRequests.get(cwd)
+}
+
+export async function ensureDesktopProject({ app = desktopApp(), cwd, projectName = '' } = {}) {
+  if (!app || !cwd) return null
+  try {
+    const rpc = await findDesktop(app)
+    if (!rpc) return null
+    return await projectFor(rpc, cwd, '', projectName)
+  } catch {
+    return null
+  }
 }
 
 async function modelFor(rpc, model, effort, signal) {
@@ -474,13 +488,13 @@ async function modelFor(rpc, model, effort, signal) {
   return picked
 }
 
-export async function runDesktopTurn({app, cwd, session, prompt, historyPrompt, title, images = [], model, effort, write, signal, emit, rpc}) {
+export async function runDesktopTurn({app, cwd, projectName = '', session, prompt, historyPrompt, title, titleLocked = false, images = [], model, effort, write, signal, emit, rpc}) {
   if (session) stopWatchingDesktopCallbacks(session)
   rpc ??= await connect(app, signal)
   const selected = await modelFor(rpc, model, effort, signal)
   const summaries = async () => (await rpc('GetAllCascadeTrajectories', {excludeSubtrajectories:true}, signal)).trajectorySummaries || {}
   const previous = session ? (await summaries())[session] : null
-  const project = await projectFor(rpc, cwd, previous?.trajectoryMetadata?.projectId)
+  const project = await projectFor(rpc, cwd, previous?.trajectoryMetadata?.projectId, projectName)
   let id = session, offset = 0
   if (previous && previous.trajectoryMetadata?.projectId === project && previous.source !== 'CORTEX_TRAJECTORY_SOURCE_CLI') {
     if ((previous.status && !previous.status.endsWith('_IDLE')) || previous.notFullyIdle) throw Error('这条 Antigravity 会话仍在运行，请等当前轮次结束。')
@@ -499,7 +513,7 @@ export async function runDesktopTurn({app, cwd, session, prompt, historyPrompt, 
     if (!id) throw Error('Antigravity 未返回桌面会话 ID')
     emit('session', id)
   }
-  if (title && (id !== session || title !== previous?.annotations?.title)) await rpc('UpdateConversationAnnotations', {cascadeIds:[id], annotations:{title}, mergeAnnotations:true}, signal)
+  if (titleLocked && title && (id !== session || title !== previous?.annotations?.title)) await rpc('UpdateConversationAnnotations', {cascadeIds:[id], annotations:{title}, mergeAnnotations:true}, signal)
   emit('log', '已连接 Antigravity 项目会话' + (selected ? ' · ' + selected.label : ''))
   const toolConfig = write ? {} : {
     autoInteractionBehavior:2,
@@ -676,6 +690,16 @@ export async function readDesktopTitle(cascadeId) {
   const meta = await rpc('GetAllCascadeTrajectories', { excludeSubtrajectories: true }, signal).catch(() => null)
   const summary = meta?.trajectorySummaries?.[cascadeId]?.summary || ''
   return typeof summary === 'string' ? summary.trim() : ''
+}
+
+export async function setDesktopTitle(cascadeId, title) {
+  if (!cascadeId || !title) return false
+  const app = desktopApp()
+  if (!app) return false
+  const rpc = await findDesktop(app).catch(() => null)
+  if (!rpc) return false
+  await rpc('UpdateConversationAnnotations', { cascadeIds: [cascadeId], annotations: { title }, mergeAnnotations: true }, AbortSignal.timeout(5000))
+  return true
 }
 
 export async function listDesktopSessions(projectDir = '') {
