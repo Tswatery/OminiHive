@@ -853,7 +853,8 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
   const fileInput = useRef<HTMLInputElement>(null)
   const scroll = useRef<HTMLDivElement>(null)
   const timelineShellRef = useRef<HTMLDivElement>(null)
-  const follow = useRef(true)
+  // One-shot bottom scroll (room switch / user send); never fight user scrolling during streaming.
+  const scrollToBottomPending = useRef(true)
   const prevMentionsRef = useRef<Agent[]>([])
 
   const readyAgents = tree ? agents.filter(a => tree.agents[a]) : agents
@@ -1147,14 +1148,15 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
     setMention(null)
     setSlash(null)
     setError('')
-    follow.current = true
+    scrollToBottomPending.current = true
   }, [room])
 
   useEffect(() => {
-    if (follow.current && scroll.current) {
+    if (scrollToBottomPending.current && messagesRoom === room && scroll.current) {
       scroll.current.scrollTop = scroll.current.scrollHeight
+      scrollToBottomPending.current = false
     }
-  }, [messages])
+  }, [messages, messagesRoom, room])
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -1365,7 +1367,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
     setMention(null)
     setSlash(null)
     if (payload.targetList.length) updateTargets(payload.targetList, payload.room)
-    follow.current = true
+    if (payload.room === room) scrollToBottomPending.current = true
     try {
       await api.send(payload.room, payload.raw, agentWrite, buildPrefs(payload.room, payload.targetList), effort, payload.targets, payload.images)
       setFreshSessions(prev => {
@@ -1782,10 +1784,6 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
         <div
           className="timeline"
           ref={scroll}
-          onScroll={e => {
-            const el = e.currentTarget
-            follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100
-          }}
         >
           {messagesRoom === room && !roomMessages.length ? (
             <div className="welcome">

@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useRef, useState } from 'react'
+import React, { createContext, useContext, useEffect, useState } from 'react'
 import { Check, ChevronRight, ExternalLink, Images, ShieldAlert } from 'lucide-react'
 import { cleanError } from './errors'
 import { LocalImageThumb, type LightboxImageItem } from './ImageLightbox'
@@ -50,16 +50,9 @@ export function StepTimelineItem({
   const [submittedLabel, setSubmittedLabel] = useState('')
   const [submitErr, setSubmitErr] = useState('')
   const [customAnswer, setCustomAnswer] = useState('')
-  const detailRef = useRef<HTMLPreElement>(null)
   const hasDetail = Boolean(step.detail?.trim())
   const open = manualOpen !== null ? manualOpen : defaultOpen
   const interaction = step.status === 'waiting' ? step.interaction : null
-
-  useEffect(() => {
-    if (open && step.status === 'running' && detailRef.current) {
-      detailRef.current.scrollTop = detailRef.current.scrollHeight
-    }
-  }, [open, step.status, step.detail])
 
   useEffect(() => {
     if (step.status !== 'waiting') {
@@ -220,7 +213,7 @@ export function StepTimelineItem({
           {submitErr && <div className="step-interact-err">{submitErr}</div>}
         </div>
       )}
-      {open && hasDetail && <pre ref={detailRef} className="step-detail">{step.detail}</pre>}
+      {open && hasDetail && <pre className="step-detail">{step.detail}</pre>}
     </div>
   )
 }
