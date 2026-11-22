@@ -52,6 +52,8 @@ declare global {
       renameProject(id: string, name: string): Promise<void>
       renameRoom(id: string, title: string): Promise<void>
       externalSessions(projectId: string): Promise<ExternalSessionItem[]>
+      searchCodexSessions(projectId: string, query: string): Promise<ExternalSessionItem[]>
+      importSharedChat(projectId: string, url: string): Promise<string>
       importSession(projectId: string, item: ExternalSessionItem): Promise<string>
       volcQuota(): Promise<QuotaResult>
       volcLogin(): Promise<QuotaResult>

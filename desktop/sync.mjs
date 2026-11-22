@@ -236,7 +236,7 @@ function safeRealpath(p) {
   try { return realpathSync(p) } catch { return p }
 }
 
-function listCodexSessions(projectDir = '') {
+export function listCodexSessions(projectDir = '', query = '') {
   const codexHome = process.env.CODEX_HOME || path.join(homedir(), '.codex')
   const dbPath = path.join(codexHome, 'state_5.sqlite')
   if (!existsSync(dbPath)) return []
@@ -244,13 +244,19 @@ function listCodexSessions(projectDir = '') {
   let db
   try {
     db = new DatabaseSync(dbPath, { readOnly: true })
+    const columns = new Set(db.prepare('PRAGMA table_info(threads)').all().map(row => row.name))
+    const optional = key => columns.has(key) ? key : 'NULL'
+    const hasProjects = columns.has('project_id') && db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='projects'").get()
+    const projectName = hasProjects ? '(SELECT name FROM projects WHERE projects.id=threads.project_id)' : 'NULL'
+    const term = query.trim()
+    const fields = [optional('name'), 'title', 'cwd', projectName, optional('first_user_message')]
+    const matches = fields.map(field => `instr(lower(${field}), lower(?)) > 0`).join(' OR ')
     const rows = db.prepare(
-      `SELECT id, name, title, first_user_message, cwd, updated_at, updated_at_ms, rollout_path
-       FROM threads
-       WHERE COALESCE(archived, 0) = 0
-       ORDER BY COALESCE(updated_at_ms, updated_at * 1000, 0) DESC
-       LIMIT 80`
-    ).all()
+      `SELECT id, ${optional('name')} AS name, title, ${optional('first_user_message')} AS first_user_message,
+              cwd, archived, updated_at, ${optional('updated_at_ms')} AS updated_at_ms
+       FROM threads WHERE ${term ? matches : 'COALESCE(archived, 0) = 0'}
+       ORDER BY COALESCE(updated_at_ms, updated_at * 1000, 0) DESC ${term ? '' : 'LIMIT 80'}`
+    ).all(...(term ? Array(fields.length).fill(term) : []))
     const out = []
     for (const r of rows) {
       if (!r?.id) continue
@@ -262,13 +268,15 @@ function listCodexSessions(projectDir = '') {
         agent: 'Codex',
         nativeId: r.id,
         title: cleanTitle.slice(0, 60),
+        archived: Boolean(r.archived),
         cwd: normCwd || r.cwd || '',
         updatedAt,
         sameProject: Boolean(normTarget && normCwd && normTarget === normCwd)
       })
     }
     return out
-  } catch {
+  } catch (error) {
+    if (query.trim()) throw error
     return []
   } finally {
     try { db?.close() } catch {}

@@ -6,13 +6,14 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import { createQuotaClient } from './volc-quota.mjs'
 import { createCatalog } from './catalog.mjs'
+import { readSharedChat } from './shared-chat.mjs'
 import { Store, routeTargets } from './store.mjs'
 import { execute, availability, respondAgentInteraction, killAllAgentProcesses, syncCodexProject, setCodexThreadName } from './agents.mjs'
 import { respondDesktopInteraction, focusDesktopApp, cancelDesktopBackground, ensureDesktopProject, readDesktopTitle, setDesktopTitle } from './antigravity-desktop.mjs'
 import { initClients, inventory, updates, upgrade, isUpgrading, binary, dirs } from './clients.mjs'
 import { ccSwitchSummary } from './ccswitch.mjs'
 import { listFiles, previewFile, listAgentSkills, resolveLocalFilePath, getGitStatus, opensAsProgram } from './workspace.mjs'
-import { syncRoomExternal, listExternalSessions, loadExternalSessionTurns, findClaudeTranscript } from './sync.mjs'
+import { syncRoomExternal, listCodexSessions, listExternalSessions, loadExternalSessionTurns, findClaudeTranscript } from './sync.mjs'
 import { generateTitleWithCodex, looksLikeSmartTitle, appendClaudeTitle } from './auto-title.mjs'
 
 app.setName('OminiHive')
@@ -410,6 +411,16 @@ else app.whenReady().then(async () => {
     const proj = store.get('SELECT dir FROM projects WHERE id=?', projectId)
     return listExternalSessions(proj?.dir || '')
   })
+  handle('searchCodexSessions', (projectId, query) => {
+    const project = store.get('SELECT dir FROM projects WHERE id=?', projectId)
+    return listCodexSessions(project?.dir || '', query)
+  })
+  handle('importSharedChat', async (projectId, url) => {
+    const chat = await readSharedChat(url, (endpoint, options) => net.fetch(endpoint, options))
+    const id = store.importRoom(projectId, { ...chat, shared: true })
+    changed()
+    return id
+  })
   handle('importSession', async (projectId, item) => {
     const proj = store.get('SELECT id, dir FROM projects WHERE id=?', projectId)
     if (!proj) throw Error('未找到对应项目')
@@ -417,6 +428,7 @@ else app.whenReady().then(async () => {
     const nativeId = String(item?.nativeId || '')
     if (!agent || !nativeId) throw Error('无效的会话参数')
     const turns = await loadExternalSessionTurns(agent, nativeId, proj.dir)
+    if (agent === 'Codex' && !turns.length) throw Error('本机会话索引中有此记录，但未读到可导入的消息。')
     const roomId = store.importRoom(projectId, {
       agent,
       nativeId,

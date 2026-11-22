@@ -12,6 +12,7 @@ export type ExternalSessionItem = {
   title: string
   cwd: string
   updatedAt: number
+  archived?: boolean
   sameProject: boolean
 }
 
@@ -51,12 +52,35 @@ export function ImportSessionModal({
   const [loading, setLoading] = useState(false)
   const [importingId, setImportingId] = useState('')
   const [err, setErr] = useState('')
-  const [agentFilter, setAgentFilter] = useState<'all' | 'Codex' | 'Antigravity' | 'Claude'>('all')
+  const [agentFilter, setAgentFilter] = useState<'all' | 'Codex' | 'Antigravity' | 'Claude' | 'share'>('all')
   const [onlySameProject, setOnlySameProject] = useState(true)
   const [query, setQuery] = useState('')
 
+  const [shareUrl, setShareUrl] = useState('')
+  const shareMode = agentFilter === 'share'
+  const [searchResult, setSearchResult] = useState<{ key: string; rows: ExternalSessionItem[]; error?: string } | null>(null)
+  const [refreshVersion, setRefreshVersion] = useState(0)
+  const term = query.trim()
+  const searchCodex = open && !shareMode && Boolean(term) && (agentFilter === 'all' || agentFilter === 'Codex')
+  const searchKey = JSON.stringify([projectId, term, refreshVersion])
+
+  useEffect(() => {
+    if (!searchCodex) return
+    let active = true
+    const timer = setTimeout(async () => {
+      try {
+        const rows = await window.hive.searchCodexSessions(projectId, term)
+        if (active) setSearchResult({ key: searchKey, rows })
+      } catch (e) {
+        if (active) setSearchResult({ key: searchKey, rows: [], error: cleanError(e) })
+      }
+    }, 180)
+    return () => { active = false; clearTimeout(timer) }
+  }, [searchCodex, projectId, term, searchKey])
+
   async function refresh() {
     if (!projectId) return
+    setRefreshVersion(v => v + 1)
     setLoading(true)
     setErr('')
     try {
@@ -75,21 +99,22 @@ export function ImportSessionModal({
   useEffect(() => {
     if (open && projectId) {
       setOnlySameProject(true)
+      setShareUrl('')
       setQuery('')
       setAgentFilter('all')
       void refresh()
     }
   }, [open, projectId])
 
-  const filtered = useMemo(() => {
+  const matches = useMemo(() => {
     const q = query.trim().toLowerCase()
-    return items.filter(it => {
-      if (onlySameProject && !it.sameProject) return false
+    const rows = searchCodex ? [...(searchResult?.key === searchKey ? searchResult.rows : []), ...items.filter(it => it.agent !== 'Codex')] : items
+    return rows.filter(it => {
       if (agentFilter !== 'all' && it.agent !== agentFilter) return false
-      if (q && !it.title.toLowerCase().includes(q) && !it.cwd.toLowerCase().includes(q)) return false
+      if (q && it.agent !== 'Codex' && !it.title.toLowerCase().includes(q) && !it.cwd.toLowerCase().includes(q)) return false
       return true
     })
-  }, [items, onlySameProject, agentFilter, query])
+  }, [items, agentFilter, query, searchCodex, searchKey, searchResult])
 
   async function handleImport(item: ExternalSessionItem) {
     if (importingId) return
@@ -106,23 +131,40 @@ export function ImportSessionModal({
     }
   }
 
-  const sameCount = items.filter(x => x.sameProject).length
+  async function importLink(e: React.FormEvent) {
+    e.preventDefault()
+    if (importingId || !shareUrl.trim()) return
+    setImportingId('share')
+    setErr('')
+    try {
+      const room = await window.hive.importSharedChat(projectId, shareUrl.trim())
+      onOpenChange(false)
+      onImported(room)
+    } catch (error) {
+      setErr(cleanError(error))
+    } finally {
+      setImportingId('')
+    }
+  }
+
+  const sameCount = matches.filter(x => x.sameProject).length
+  const filtered = onlySameProject ? matches.filter(it => it.sameProject) : matches
 
   return (
-    <Dialog.Root open={open} onOpenChange={onOpenChange}>
+    <Dialog.Root open={open} onOpenChange={next => { if (!importingId) onOpenChange(next) }}>
       <Dialog.Content className="import-modal" maxWidth="620px">
         <div className="import-head">
           <div>
             <Dialog.Title size="4" mb="1">导入外部会话</Dialog.Title>
             <Dialog.Description size="2" color="gray">
-              将 Codex、Antigravity 或 Claude 客户端的已有会话导入到「{projectName}」并继续对话
+              将本机会话或公开分享的对话导入「{projectName}」
             </Dialog.Description>
           </div>
           <div className="import-head-actions">
-            <button type="button" className="icon-btn" onClick={() => void refresh()} title="刷新列表" disabled={loading}>
+            <button type="button" className="icon-btn" onClick={() => void refresh()} title="刷新列表" disabled={loading || shareMode}>
               <RefreshCw size={14} className={loading ? 'spin' : ''} />
             </button>
-            <button type="button" className="icon-btn" onClick={() => onOpenChange(false)} aria-label="关闭">
+            <button type="button" className="icon-btn" onClick={() => onOpenChange(false)} aria-label="关闭" disabled={Boolean(importingId)}>
               <X size={15} />
             </button>
           </div>
@@ -130,27 +172,40 @@ export function ImportSessionModal({
 
         <div className="import-controls">
           <div className="import-tabs">
-            {(['all', 'Codex', 'Antigravity', 'Claude'] as const).map(tab => (
+            {(['all', 'Codex', 'Antigravity', 'Claude', 'share'] as const).map(tab => (
               <button
                 key={tab}
                 type="button"
                 className={'import-tab' + (agentFilter === tab ? ' active' : '')}
-                onClick={() => setAgentFilter(tab)}
+                disabled={Boolean(importingId)}
+                onClick={() => { setAgentFilter(tab); setErr('') }}
               >
-                {tab === 'all' ? '全部' : tab}
+                {tab === 'all' ? '全部' : tab === 'share' ? '共享链接' : tab}
               </button>
             ))}
           </div>
-          <label className="import-scope-toggle">
+          {!shareMode && <label className="import-scope-toggle">
             <input
               type="checkbox"
               checked={onlySameProject}
               onChange={e => setOnlySameProject(e.target.checked)}
             />
             <span>仅当前项目 ({sameCount})</span>
-          </label>
+          </label>}
         </div>
 
+        {err && <div className="import-error" role="alert">{err}</div>}
+        {shareMode ? <form className="share-import-form" onSubmit={importLink}>
+          <label htmlFor="shared-chat-url">ChatGPT 或 Gemini 公开分享链接</label>
+          <div className="import-search">
+            <input id="shared-chat-url" type="url" autoFocus required placeholder="粘贴分享链接…"
+              value={shareUrl} onChange={e => setShareUrl(e.target.value)} disabled={Boolean(importingId)} />
+            <button type="submit" className="import-btn" disabled={!shareUrl.trim() || Boolean(importingId)}>
+              {importingId ? '正在导入…' : '导入对话'}
+            </button>
+          </div>
+          <small>按原顺序导入文字记录，图片和文件仅保留分享中可读取的说明。</small>
+        </form> : <>
         <div className="import-search">
           <Search size={14} />
           <input
@@ -161,16 +216,17 @@ export function ImportSessionModal({
           />
         </div>
 
-        {err && <div className="import-error">{err}</div>}
+        {searchCodex && searchResult?.key === searchKey && searchResult.error && <div className="import-error">{searchResult.error}</div>}
+
 
         <ScrollArea className="import-list" variant="input" insetTop={4} insetBottom={4}>
-          {loading && items.length === 0 ? (
+          {searchCodex && searchResult?.key !== searchKey ? <div className="import-empty">正在搜索全部本机 Codex 会话…</div> : loading && items.length === 0 ? (
             <div className="import-empty">正在读取本机 Codex / Antigravity / Claude 会话…</div>
           ) : filtered.length === 0 ? (
             <div className="import-empty">
-              {onlySameProject && items.length > 0
+              {onlySameProject && matches.length > 0
                 ? '当前项目目录下暂无匹配会话，可取消勾选「仅当前项目」查看全部会话。'
-                : '未找到可导入的外部会话（请确认对应客户端已运行或有历史记录）。'}
+                : '未找到匹配的会话。'}
             </div>
           ) : (
             filtered.map(item => {
@@ -181,6 +237,7 @@ export function ImportSessionModal({
                     <div className="import-row-title">
                       <AgentIcon name={item.agent} size={16} />
                       <span>{item.title}</span>
+                      {item.archived && <em className="import-badge">已归档</em>}
                       {item.sameProject && <em className="import-badge">本项目</em>}
                     </div>
                     <div className="import-row-meta">
@@ -208,6 +265,7 @@ export function ImportSessionModal({
             })
           )}
         </ScrollArea>
+        </>}
       </Dialog.Content>
     </Dialog.Root>
   )

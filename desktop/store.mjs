@@ -204,7 +204,7 @@ export class Store {
     return this.get('SELECT r.title, COALESCE(r.title_locked,0) AS title_locked, COALESCE(r.title_auto,0) AS title_auto, p.dir, p.name FROM rooms r JOIN projects p ON p.id=r.project WHERE r.id=?', id) || null
   }
 
-  importRoom(projectId, { agent, nativeId, title, turns = [] }) {
+  importRoom(projectId, { agent, nativeId, title, shared = false, turns = [] }) {
     const proj = this.get('SELECT id, dir FROM projects WHERE id=?', projectId)
     if (!proj) throw Error('未找到对应项目')
     const roomId = randomUUID()
@@ -221,8 +221,8 @@ export class Store {
         if (!text) continue
         const msgId = randomUUID()
         const author = t.role === 'user' ? '我' : agent
-        const body = t.role === 'user' ? `@${agent} ${text}` : text
-        const log = t.role === 'user' ? '' : `导入自 ${agent} 客户端\n`
+        const body = t.role === 'user' && nativeId ? `@${agent} ${text}` : text
+        const log = t.role === 'user' ? '' : shared ? '从分享链接导入' : `导入自 ${agent} 客户端\n`
         const ts = Number(t.time) || (now + i)
         this.run(
           'INSERT INTO messages(id,room,author,body,log,status,time,duration,attachments) VALUES(?,?,?,?,?,?,?,?,?)',
@@ -323,7 +323,7 @@ export class Store {
 
     // Fetch all valid non-running, non-empty messages from other authors in chronological order
     const rows = this.all(
-      "SELECT rowid,id,author,body FROM messages WHERE room=? AND author!=? AND status!='执行中' AND length(trim(body))>0 ORDER BY rowid ASC",
+      "SELECT rowid,id,author,body FROM messages WHERE room=? AND (author!=? OR log='从分享链接导入') AND status!='执行中' AND length(trim(body))>0 ORDER BY rowid ASC",
       room, agent
     )
 

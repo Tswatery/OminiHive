@@ -3588,6 +3588,14 @@ main {
   outline: none;
 }
 
+.share-import-form {
+  display: grid;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.share-import-form small { color: var(--text-muted); }
+
 .import-error {
   padding: 8px 10px;
   border-radius: 8px;

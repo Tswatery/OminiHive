@@ -4,6 +4,7 @@ import { VENDOR_ICON_SRC } from './iconRegistry'
 
 const agentAssetSrc: Record<string, string> = {
   Codex: './agents/codex.svg',
+  ChatGPT: VENDOR_ICON_SRC.openai,
   Claude: './agents/claudecode.svg',
   Antigravity: './agents/antigravity.svg',
   Gemini: VENDOR_ICON_SRC.gemini,
