@@ -7,6 +7,7 @@ import { ModelIcon } from './ModelIcon'
 import { AgentIcon } from './AgentIcon'
 import { agentLabel } from './agentMeta'
 import { ScrollArea } from './OverlayScrollbar'
+import { Tip } from './Tip'
 import { cleanError } from './errors'
 
 export type ModelOption = Option & { efforts: string[]; defaultEffort?: string; isDefault?: boolean }
@@ -148,7 +149,7 @@ function EffortCapsuleSlider({
 }
 
 export function ModelEffortPicker({
-  agent, models, model, onModel, effort, onEffort, onOpen, hint
+  agent, models, model, onModel, effort, onEffort, fast, onToggleFast, onOpen, hint
 }: {
   agent: string
   models: ModelOption[]
@@ -156,6 +157,8 @@ export function ModelEffortPicker({
   onModel: (v: string) => void
   effort: string
   onEffort: (v: string) => void
+  fast?: boolean
+  onToggleFast?: () => void
   onOpen: () => void
   hint?: string
 }) {
@@ -164,19 +167,26 @@ export function ModelEffortPicker({
   const level = effort || active?.defaultEffort || ''
   const modelLabel = active?.label || model || '默认模型'
   const effortTitle = effort || level || 'auto'
+  const canFast = agent === 'Codex' && Boolean(onToggleFast)
+  const fastOn = canFast && Boolean(fast)
 
   return (
     <Popover.Root onOpenChange={open => { if (open) onOpen() }}>
       <Popover.Trigger>
-        <button type="button" className="tool-chip" aria-label={agent + ' 模型与思考强度'}>
+        <button type="button" className="tool-chip model-chip" aria-label={agent + ' 模型与思考强度'}>
           <ModelIcon model={active?.id || model} label={active?.label} size={13} />
           <span className="tool-chip-label">{modelLabel}</span>
-          {steps.length > 1 && (
-            <span className="tool-chip-sub">
-              <Zap size={11} />
+          {steps.length > 1 ? (
+            <span className={'tool-chip-sub' + (fastOn ? ' fast-on' : '')}>
+              <Zap size={11} fill={fastOn ? 'currentColor' : 'none'} />
               {effortTitle || '自动'}
             </span>
-          )}
+          ) : fastOn ? (
+            <span className="tool-chip-sub fast-on">
+              <Zap size={11} fill="currentColor" />
+              Fast
+            </span>
+          ) : null}
           <ChevronDown size={12} className="tool-chip-caret" />
         </button>
       </Popover.Trigger>
@@ -214,7 +224,27 @@ export function ModelEffortPicker({
 
         <div className="panel-section panel-effort">
           <div className="effort-top">
-            <span className="effort-label"><Zap size={13} /> 思考强度</span>
+            <span className="effort-label">
+              {canFast ? (
+                <Tip
+                  side="top"
+                  content={fastOn ? 'Fast 模式已开启（1.5–2x 速度，用量更多）· 点击关闭' : '开启 Codex Fast 模式（1.5–2x 速度，用量更多）'}
+                >
+                  <button
+                    type="button"
+                    className={'fast-mode-btn' + (fastOn ? ' active' : '')}
+                    aria-label={fastOn ? '关闭 Fast 模式' : '开启 Fast 模式'}
+                    aria-pressed={fastOn}
+                    onClick={onToggleFast}
+                  >
+                    <Zap size={13} fill={fastOn ? 'currentColor' : 'none'} />
+                  </button>
+                </Tip>
+              ) : (
+                <Zap size={13} />
+              )}
+              思考强度
+            </span>
             <strong>{level || 'auto'}{!effort && level ? ' · default' : ''}</strong>
             {effort && (
               <IconButton variant="ghost" color="gray" size="1" title="恢复默认强度" aria-label="恢复默认强度" onClick={() => onEffort('')}>

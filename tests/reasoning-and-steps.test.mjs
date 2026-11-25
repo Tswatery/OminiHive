@@ -8,7 +8,7 @@ import {
   parseEffortsFromHelp
 } from '../desktop/reasoning.mjs'
 import { createStepAdapter } from '../desktop/step-tracker.mjs'
-import { buildDeepSeekArgs } from '../desktop/agents.mjs'
+import { buildDeepSeekArgs, formatClaudeSystemStep } from '../desktop/agents.mjs'
 
 test('all registered agents receive unified reasoning effort levels', () => {
   for (const agent of Object.keys(names)) {
@@ -137,4 +137,50 @@ test('DeepSeekStreamAdapter parses dsh headless --json events without duplicatin
   assert.ok(steps.some(s => s.kind === 'thought' && s.status === 'done' && s.detail.includes('先分析需求')))
   assert.ok(steps.some(s => s.kind === 'tool' && s.id === 'call-1' && s.status === 'running' && s.title.includes('pwd')))
   assert.ok(steps.some(s => s.kind === 'tool' && s.id === 'call-1' && s.status === 'done' && s.detail.includes('/tmp')))
+})
+
+test('formatClaudeSystemStep surfaces 408 timeout retries, exhausted errors, and compaction status', () => {
+  const retry408 = formatClaudeSystemStep({
+    type: 'system',
+    subtype: 'api_error',
+    error: { status: 408, formatted: '408 request body upload interrupted or timed out' },
+    retryAttempt: 2,
+    maxRetries: 10,
+    retryInMs: 1200
+  })
+  assert.equal(retry408.id, 'claude-api-retry')
+  assert.equal(retry408.status, 'running')
+  assert.match(retry408.title, /2\/10/)
+  assert.match(retry408.title, /408 请求体上传超时/)
+  assert.match(retry408.detail, /1\.2s/)
+  assert.match(retry408.detail, /重置会话/)
+
+  const exhausted = formatClaudeSystemStep({
+    type: 'system',
+    subtype: 'api_error',
+    error: { status: 502, message: '502 status code' },
+    retryAttempt: 10,
+    maxRetries: 10
+  })
+  assert.equal(exhausted.status, 'error')
+  assert.match(exhausted.title, /重试失败/)
+
+  const compacting = formatClaudeSystemStep({ type: 'system', subtype: 'status', status: 'compacting' })
+  assert.equal(compacting.id, 'claude-compact')
+  assert.equal(compacting.status, 'running')
+
+  const compacted = formatClaudeSystemStep({ type: 'system', subtype: 'compact_boundary' })
+  assert.equal(compacted.id, 'claude-compact')
+  assert.equal(compacted.status, 'done')
+})
+
+test('resolveCodexFastTier picks the Fast serviceTier id from model catalog and falls back to priority', async () => {
+  const { resolveCodexFastTier } = await import('../desktop/agents.mjs')
+  const catalog = [
+    { model: 'gpt-6.2-astra', isDefault: true, serviceTiers: [{ id: 'priority', name: 'Fast', description: '2x speed' }] },
+    { model: 'gpt-custom', isDefault: false, serviceTiers: [{ id: 'fast', name: 'Fast', description: 'fast' }] }
+  ]
+  assert.equal(resolveCodexFastTier(catalog, 'gpt-6.2-astra'), 'priority')
+  assert.equal(resolveCodexFastTier(catalog, 'gpt-custom'), 'fast')
+  assert.equal(resolveCodexFastTier([], 'gpt-6.2-astra'), 'priority')
 })

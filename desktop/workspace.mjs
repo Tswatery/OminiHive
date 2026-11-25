@@ -68,7 +68,44 @@ export function resolveLocalFilePath(rootDir, rawPath = '') {
       if (existsSync(candidate)) resolved = candidate
     }
   }
+  if (!existsSync(resolved) && rootDir) {
+    // Agents often `cd` into a sub-workspace and then print paths relative to it
+    // (e.g. `交付/报告.pptx` living under `<project>/1218工作区/交付/`). Look one or two
+    // levels below the project root before giving up.
+    const found = findInSubdirs(rootDir, resolved) || findInSubdirs(rootDir, resolveBase(target.replace(/(?:#L?\d+(?:-L?\d+)?|:\d+(?::\d+)?)$/i, '')))
+    if (found) resolved = found
+  }
   return resolved
+}
+
+const SUBDIR_SEARCH_DEPTH = 2
+const SUBDIR_SEARCH_LIMIT = 300
+
+/** `missingAbs` lies inside `rootDir` but does not exist; find `<rootDir>/<sub…>/<same relative path>`. */
+function findInSubdirs(rootDir, missingAbs) {
+  const root = path.resolve(rootDir)
+  const rel = path.relative(root, missingAbs)
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return ''
+  let level = [root]
+  let visited = 0
+  for (let depth = 0; depth < SUBDIR_SEARCH_DEPTH && level.length; depth++) {
+    const next = []
+    for (const dir of level) {
+      let entries
+      try { entries = readdirSync(dir, { withFileTypes: true }) } catch { continue }
+      entries.sort((a, b) => a.name.localeCompare(b.name))
+      for (const ent of entries) {
+        if (!ent.isDirectory() || ent.name.startsWith('.') || IGNORE_NAMES.has(ent.name)) continue
+        if (++visited > SUBDIR_SEARCH_LIMIT) return ''
+        const sub = path.join(dir, ent.name)
+        const candidate = path.join(sub, rel)
+        if (existsSync(candidate)) return candidate
+        next.push(sub)
+      }
+    }
+    level = next
+  }
+  return ''
 }
 
 export function listFiles(rootDir, relDir = '') {

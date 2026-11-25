@@ -5,11 +5,15 @@ import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { createQuotaClient } from './volc-quota.mjs'
+import { createContextUsage } from './context-usage.mjs'
+import { createAgentQuota } from './agent-quota.mjs'
+import { probeClaudeWindow } from './claude-window.mjs'
+import { antigravityEnv } from './antigravity-env.mjs'
 import { createCatalog } from './catalog.mjs'
 import { readSharedChat } from './shared-chat.mjs'
 import { Store, routeTargets } from './store.mjs'
 import { execute, availability, respondAgentInteraction, killAllAgentProcesses, syncCodexProject, setCodexThreadName } from './agents.mjs'
-import { respondDesktopInteraction, focusDesktopApp, cancelDesktopBackground, ensureDesktopProject, readDesktopTitle, setDesktopTitle } from './antigravity-desktop.mjs'
+import { respondDesktopInteraction, focusDesktopApp, cancelDesktopBackground, ensureDesktopProject, readDesktopTitle, setDesktopTitle, readDesktopContext } from './antigravity-desktop.mjs'
 import { initClients, inventory, updates, upgrade, isUpgrading, binary, dirs } from './clients.mjs'
 import { ccSwitchSummary } from './ccswitch.mjs'
 import { listFiles, previewFile, listAgentSkills, resolveLocalFilePath, getGitStatus, opensAsProgram } from './workspace.mjs'
@@ -22,7 +26,7 @@ protocol.registerSchemesAsPrivileged([
 ])
 const root = fileURLToPath(new URL('../', import.meta.url))
 const page = path.join(root, 'dist/index.html')
-let win, store, timer, activeRoomId = ''
+let win, store, timer, activeRoomId = '', contextUsage, liveSizeTimer = null, lastLiveSig = ''
 const jobs = new Map()
 const bgRunning = new Map()
 // Messages the user explicitly stopped: late events from a background watcher must not revive them.
@@ -34,6 +38,7 @@ function stopBackground(key) {
   const bg = bgRunning.get(key)
   if (!bg) return null
   bgRunning.delete(key)
+  contextUsage?.setLive(bg.room, bg.agent, false)
   stoppedMsgIds.add(bg.msgId)
   if (stoppedMsgIds.size > 200) stoppedMsgIds.delete(stoppedMsgIds.values().next().value)
   store.finish(bg.msgId, '已停止')
@@ -89,47 +94,68 @@ function syncExternalProjects(cwd, projectName = '') {
   void ensureDesktopProject({ cwd, projectName }).catch(() => null)
 }
 
-// Pushes a room title into every native client session bound to the room.
+// room\nagent\nnative -> title already written to that native session (avoids repeats).
+const titleWritten = new Map()
+
+// Pushes a room title into every native client session bound to the room. Sessions that don't
+// exist yet or are busy are skipped and picked up after a later turn, since this runs again then.
 async function writeBackTitle(roomId, title, { custom = false, skipAgents = [] } = {}) {
   const st = store.roomTitleState(roomId)
   if (!st || !title) return
   const busy = new Set(allRunning().filter(j => j.room === roomId).map(j => j.agent))
   await Promise.all(store.listSessions(roomId).map(async ({ agent, native }) => {
     if (!native || skipAgents.includes(agent)) return
+    const key = roomId + '\n' + agent + '\n' + native
+    if (!custom && titleWritten.get(key) === title) return
+    let ok = false
     try {
       // Provider-specific sessions live in separate homes or CLIs that native clients don't show.
-      if (agent === 'Codex') await setCodexThreadName(native, title)
-      else if (agent === 'Antigravity') await setDesktopTitle(native, title)
+      if (agent === 'Codex') ok = await setCodexThreadName(native, title)
+      else if (agent === 'Antigravity') ok = await setDesktopTitle(native, title)
       else if (agent.split(':')[0] === 'Claude' && !busy.has('Claude')) {
-        appendClaudeTitle(findClaudeTranscript(native, st.dir), native, title, { custom })
+        ok = appendClaudeTitle(findClaudeTranscript(native, st.dir), native, title, { custom })
       }
     } catch {}
+    if (ok) titleWritten.set(key, title)
   }))
 }
 
 const autoNaming = new Set()
+const namingAttempts = new Map()
+const MAX_NAMING_ATTEMPTS = 3
 
-// After the first completed turn, replace the "first words of the message" title with a summary.
-// Antigravity names its own conversations, so when it took part its title wins; otherwise Codex generates one.
+// Replaces the "first words of the message" title with a summary as soon as the first message
+// is sent (not after a reply: a long or stopped first turn would otherwise leave it unnamed).
+// Antigravity names its own conversations, so when it takes part its title wins; otherwise Codex
+// generates one. Called again after every turn: retries a failed attempt (bounded) and writes the
+// title back to native sessions that didn't exist or were busy the first time.
 async function autoNameRoom(roomId) {
   if (!store || autoNaming.has(roomId)) return
   const st = store.roomTitleState(roomId)
-  if (!st || st.title_locked || st.title_auto > 0) return
+  if (!st || st.title_locked) return
+  if (st.title_auto > 0) {
+    await writeBackTitle(roomId, st.title).catch(() => {})
+    return
+  }
   const first = store.get("SELECT body FROM messages WHERE room=? AND author='我' ORDER BY time, rowid LIMIT 1", roomId)
-  const reply = store.get("SELECT body FROM messages WHERE room=? AND author<>'我' AND status='完成' AND body<>'' ORDER BY time, rowid LIMIT 1", roomId)
-  if (!first?.body || !reply?.body) return
+  if (!first?.body) return
+  if ((namingAttempts.get(roomId) || 0) >= MAX_NAMING_ATTEMPTS) return
+  namingAttempts.set(roomId, (namingAttempts.get(roomId) || 0) + 1)
   autoNaming.add(roomId)
   try {
-    const ag = store.listSessions(roomId).find(s => s.agent === 'Antigravity' && s.native)
-    if (ag) {
-      for (let i = 0; i < 12; i++) {
+    const usesAntigravity = () => store.listSessions(roomId).some(s => s.agent === 'Antigravity') ||
+      allRunning().some(j => j.room === roomId && j.agent === 'Antigravity')
+    if (usesAntigravity()) {
+      for (let i = 0; i < 15; i++) {
         const now = store.roomTitleState(roomId)
         if (!now || now.title_locked) return
         if (now.title_auto > 0) {
           await writeBackTitle(roomId, now.title, { skipAgents: ['Antigravity'] })
           return
         }
-        const t = String(await readDesktopTitle(ag.native).catch(() => '') || '').trim()
+        // The Antigravity session id only appears once its turn has started.
+        const ag = store.listSessions(roomId).find(s => s.agent === 'Antigravity' && s.native)
+        const t = ag ? String(await readDesktopTitle(ag.native).catch(() => '') || '').trim() : ''
         if (looksLikeSmartTitle(t, first.body)) {
           if (store.autoTitleRoom(roomId, t, 1)) changed()
           await writeBackTitle(roomId, t, { skipAgents: ['Antigravity'] })
@@ -141,7 +167,8 @@ async function autoNameRoom(roomId) {
     await initClients()
     const exe = binary('Codex')
     if (!exe) return
-    const title = await generateTitleWithCodex({ exe, env: { ...process.env, PATH: dirs.join(':') }, task: first.body, reply: reply.body })
+    const reply = store.get("SELECT body FROM messages WHERE room=? AND author<>'我' AND body<>'' ORDER BY time, rowid LIMIT 1", roomId)
+    const title = await generateTitleWithCodex({ exe, env: { ...process.env, PATH: dirs.join(':') }, task: first.body, reply: reply?.body || '' })
     if (!title) return
     const now = store.roomTitleState(roomId)
     if (!now || now.title_locked || now.title_auto > 0) return
@@ -150,6 +177,23 @@ async function autoNameRoom(roomId) {
   } catch {} finally {
     autoNaming.delete(roomId)
   }
+}
+
+function agentEnv() {
+  const env = { ...process.env, PATH: dirs.join(':') }
+  for (const k of Object.keys(env)) if ((k.startsWith('CODEX_') && k !== 'CODEX_HOME') || k === 'CLAUDECODE') delete env[k]
+  return env
+}
+
+/** While an agent runs, a silent tool call still grows its session file; poll sizes so the UI stays live. */
+function watchLiveSizes() {
+  if (liveSizeTimer) return
+  liveSizeTimer = setInterval(() => {
+    const sig = contextUsage.liveSignature()
+    if (!sig) { clearInterval(liveSizeTimer); liveSizeTimer = null; lastLiveSig = ''; return }
+    if (sig !== lastLiveSig) { lastLiveSig = sig; changed() }
+  }, 2000)
+  liveSizeTimer.unref?.()
 }
 
 function changed() {
@@ -255,6 +299,8 @@ async function run(room, text, allowWrite, modelOrPrefs = '', effort = '', targe
     if (prefs?.[agent]?.fresh) freshAgents.add(agent)
   }
     runs = store.startBatch(room, text, targetAgents, agents, savedImages, sessionKeys, freshAgents)
+    // Name the room right away from the message; it doesn't need to wait for a reply.
+    void autoNameRoom(room)
   } catch (e) {
     for (const [agent, entry] of reserved) {
       if (jobs.get(room + ':' + agent) === entry) jobs.delete(room + ':' + agent)
@@ -271,17 +317,21 @@ async function run(room, text, allowWrite, modelOrPrefs = '', effort = '', targe
     const m = prefs ? (prefs[item.agent]?.model || '') : modelOrPrefs
     const ef = prefs ? (prefs[item.agent]?.effort || '') : effort
     const pv = prefs ? (prefs[item.agent]?.provider || '') : ''
+    const fast = item.agent === 'Codex' && Boolean(prefs?.[item.agent]?.fast)
     const rawAccess = prefs?.[item.agent]?.access
     const access = (rawAccess === 'read-only' || rawAccess === 'workspace' || rawAccess === 'full')
       ? rawAccess
       : ((prefs && typeof prefs[item.agent]?.write === 'boolean' ? prefs[item.agent].write : allowWrite) === true ? 'workspace' : 'read-only')
     const canWrite = access !== 'read-only'
+    contextUsage.setLive(room, item.agent, true)
+    watchLiveSizes()
     try {
       await execute({
         ...item,
         images: savedImages,
         model: m,
         effort: ef,
+        fast,
         providerId: pv,
         write: canWrite,
         access,
@@ -294,7 +344,14 @@ async function run(room, text, allowWrite, modelOrPrefs = '', effort = '', targe
             return
           }
           if (type === 'session' && item.agent === 'Antigravity') cascadeId = String(value || '')
+          if (type === 'context') {
+            contextUsage.update(room, item.agent, value && typeof value === 'object' ? value : {})
+            changed()
+            return
+          }
           if (type === 'status') {
+            contextUsage.setLive(room, item.agent, value === '执行中')
+            if (value === '执行中') watchLiveSizes()
             if (value === '执行中') {
               bgRunning.set(key, { room, agent: item.agent, msgId: item.id, cascadeId })
               store.setStatus(item.id, '执行中')
@@ -324,6 +381,7 @@ async function run(room, text, allowWrite, modelOrPrefs = '', effort = '', targe
       store.finish(item.id, controller.signal.aborted ? '已停止' : '失败')
     } finally {
       if (jobs.get(key) === job) jobs.delete(key)
+      if (bgRunning.get(key)?.msgId !== item.id) contextUsage.setLive(room, item.agent, false)
       changed()
     }
   }))
@@ -370,6 +428,19 @@ else app.whenReady().then(async () => {
   })
   await initClients()
   store = new Store(path.join(app.getPath('userData'), 'workspace.sqlite'))
+  contextUsage = createContextUsage({
+    file: path.join(app.getPath('userData'), 'context-usage.json'),
+    readAntigravityContext: id => readDesktopContext(id),
+    probeWindow: (_agent, model) => probeClaudeWindow({ exe: binary('Claude'), env: agentEnv(), model }),
+    onChange: () => changed()
+  })
+  const agentQuota = createAgentQuota({
+    binary,
+    file: path.join(app.getPath('userData'), 'agent-quota.json'),
+    env: async agent => agent === 'Antigravity' ? antigravityEnv(agentEnv()) : agentEnv()
+  })
+  // Warm the cache before the window asks, so the status bar is filled on first paint.
+  void agentQuota.read(false)
   session.defaultSession.setPermissionRequestHandler((_wc, _perm, cb) => cb(false))
   handle('tree', () => ({
     ...store.tree(),
@@ -442,6 +513,15 @@ else app.whenReady().then(async () => {
   const arkBinary = app.isPackaged ? path.join(process.resourcesPath, 'arkcli') : path.join(root, 'node_modules/.cache/ominihive/arkcli')
   const quota = createQuotaClient(arkBinary)
   handle('volcQuota', quota.read)
+  handle('agentQuota', (force, provider) => provider ? agentQuota.readOne(String(provider), Boolean(force)) : agentQuota.read(Boolean(force)))
+  handle('agentQuotaCached', () => agentQuota.peek())
+  handle('contextUsage', room => {
+    const id = String(room || '')
+    if (!id) return {}
+    const bindings = store.all('SELECT agent, native FROM sessions WHERE room=?', id)
+    void contextUsage.hydrate(id, bindings).then(touched => { if (touched) changed() })
+    return contextUsage.snapshot(id)
+  })
   handle('volcLogin', quota.login)
   handle('clients', inventory)
   handle('ccSwitch', ccSwitchSummary)
@@ -507,6 +587,11 @@ else app.whenReady().then(async () => {
     if (err) shell.showItemInFolder(resolved)
     return true
   })
+  handle('resolvePath', (targetPath, roomId) => {
+    const row = roomId ? store.get('SELECT p.dir FROM projects p JOIN rooms r ON p.id=r.project WHERE r.id=?', roomId) : null
+    const resolved = resolveLocalFilePath(row?.dir || '', targetPath)
+    return resolved && existsSync(resolved) ? resolved : ''
+  })
   handle('revealPath', (targetPath, roomId) => {
     const row = roomId ? store.get('SELECT p.dir FROM projects p JOIN rooms r ON p.id=r.project WHERE r.id=?', roomId) : null
     const resolved = resolveLocalFilePath(row?.dir || '', targetPath)
@@ -522,6 +607,12 @@ else app.whenReady().then(async () => {
     const img = nativeImage.createFromDataURL(raw)
     if (img.isEmpty()) throw Error('无法复制该图片')
     clipboard.writeImage(img)
+    return true
+  })
+  // navigator.clipboard is blocked by the deny-all permission handler above, so text copies
+  // go through the main process instead.
+  handle('copyText', text => {
+    clipboard.writeText(String(text ?? ''))
     return true
   })
   handle('respondInteraction', req => {

@@ -6,6 +6,7 @@ import { FileTypeIcon } from './FileTypeIcon'
 import type { PreviewResult } from './FileDrawer'
 import type { LightboxImageItem } from './ImageLightbox'
 import { fileExtLabel, formatBytes, friendlyDir, friendlyFileName, imageMetaLine } from './filePresentation'
+import { writeClipboardText } from './clipboard'
 
 const DEFAULT_PREVIEW_WIDTH = 460
 const PREVIEW_WIDTH_KEY = 'ominihive:preview-width'
@@ -91,7 +92,7 @@ export function FilePreviewPanel({
 
   function copyPath(p: string) {
     if (!p) return
-    void navigator.clipboard.writeText(p)
+    void writeClipboardText(p)
     setCopied(true)
     setTimeout(() => setCopied(false), 1500)
   }

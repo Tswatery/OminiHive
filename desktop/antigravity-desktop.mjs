@@ -7,6 +7,7 @@ import path from 'node:path'
 import {setTimeout as delay} from 'node:timers/promises'
 import {fileURLToPath, pathToFileURL} from 'node:url'
 import {promisify} from 'node:util'
+import {antigravityContextFromGenerators, antigravitySessionFile} from './context-usage.mjs'
 
 const run = promisify(execFile)
 const appPaths = ['/Applications/Antigravity.app', path.join(homedir(), 'Applications/Antigravity.app')]
@@ -235,6 +236,10 @@ async function pollCallbackWatchers() {
       if (stepCount <= w.offset && w.settled.size === 0 && !summaryActive && !w.isActive) continue
       const startOffset = w.offset
       const {steps = []} = await rpc('GetCascadeTrajectorySteps', {cascadeId, stepOffset:startOffset, trajectoryVerbosity:2})
+      const waitingByIndex = new Map()
+      for (const ws of Array.isArray(summary.waitingSteps) ? summary.waitingSteps : []) {
+        if (ws && ws.stepIndex != null && ws.step) waitingByIndex.set(Number(ws.stepIndex), ws.step)
+      }
       let hitNewUser = false
       let hasLiveStep = false
       for (let i = 0; i < steps.length; i++) {
@@ -243,6 +248,16 @@ async function pollCallbackWatchers() {
         if (w.settled.has(idx)) continue
         if (!isTerminalStep(step)) {
           hasLiveStep = true
+          const overlay = waitingByIndex.get(idx)
+          const waitingStep = overlay ? { ...step, requestedInteraction: step.requestedInteraction || overlay.requestedInteraction } : step
+          if (w.accessMode === 'full' && !w.autoApproved.has(idx) && (isWaitingStep(waitingStep) || waitingStep.requestedInteraction)) {
+            const approval = autoApprovalPayload(buildAgInteraction(waitingStep, idx, cascadeId, summary.trajectoryId || cascadeId))
+            if (approval) {
+              w.autoApproved.add(idx)
+              await rpc('HandleCascadeUserInteraction', {cascadeId, interaction: {trajectoryId: summary.trajectoryId || cascadeId, stepIndex: idx, ...approval}})
+                .catch(() => w.autoApproved.delete(idx))
+            }
+          }
           if (!step.plannerResponse && !step.errorMessage && !w.reportedRunning.has(idx)) {
             const item = buildAgToolStep(step, idx, 'running')
             if (item) {
@@ -270,6 +285,7 @@ async function pollCallbackWatchers() {
         }
       }
       while (w.settled.has(w.offset)) { w.settled.delete(w.offset); w.reportedRunning.delete(w.offset); w.offset++ }
+      if (summaryActive || w.isActive || steps.length) void emitDesktopContext(w.onFollowup, rpc, cascadeId)
       const nextActive = !hitNewUser && (summaryActive || (hasLiveStep && (now - w.lastProgressAt < 5 * 60 * 1000)))
       if (nextActive !== w.isActive) {
         w.isActive = nextActive
@@ -284,7 +300,7 @@ async function pollCallbackWatchers() {
   }
 }
 
-export function watchDesktopCallbacks({app, cascadeId, offset, settled, onFollowup, rpc, initialRunning = false, stepCount = 0}) {
+export function watchDesktopCallbacks({app, cascadeId, offset, settled, onFollowup, rpc, initialRunning = false, stepCount = 0, accessMode = ''}) {
   if (!cascadeId || typeof onFollowup !== 'function') return
   const now = Date.now()
   callbackWatchers.set(cascadeId, {
@@ -294,6 +310,8 @@ export function watchDesktopCallbacks({app, cascadeId, offset, settled, onFollow
     settled: new Set(settled || []),
     reportedRunning: new Set(),
     onFollowup,
+    accessMode,
+    autoApproved: new Set(),
     isActive: Boolean(initialRunning),
     lastStepCount: Number(stepCount || 0),
     lastProgressAt: now,
@@ -488,7 +506,73 @@ async function modelFor(rpc, model, effort, signal) {
   return picked
 }
 
-export async function runDesktopTurn({app, cwd, projectName = '', session, prompt, historyPrompt, title, titleLocked = false, images = [], model, effort, write, signal, emit, rpc}) {
+// Antigravity enums (exa.cortex_pb.AutoInteractionBehavior / exa.codeium_common_pb.AgentPermissionPreset).
+const AUTO_INTERACTION_ALLOW_ALL = 1
+const AUTO_INTERACTION_DENY_ALL = 2
+const PERMISSION_PRESET_REQUEST_REVIEW = 2
+const PERMISSION_PRESET_TURBO = 3
+
+/** Per-turn tool policy matching OminiHive's access mode. */
+export function desktopToolConfig(accessMode, cwd) {
+  if (accessMode === 'full') {
+    // "完全访问" = YOLO: Turbo preset plus auto-allow, so file reads outside the workspace,
+    // commands, MCP and network calls never stop the turn for confirmation.
+    return {
+      autoInteractionBehavior: AUTO_INTERACTION_ALLOW_ALL,
+      permissionConfig: {permissionsV2: true, effectivePermissionPreset: PERMISSION_PRESET_TURBO, effectiveGrants: {
+        allow: ['read_file(*)', 'write_file(*)', 'command(*)', 'unsandboxed(*)', 'mcp(*)', 'execute_url(*)', 'download_url(*)']
+      }}
+    }
+  }
+  if (accessMode === 'workspace') return {}
+  return {
+    autoInteractionBehavior: AUTO_INTERACTION_DENY_ALL,
+    permissionConfig: {permissionsV2: true, effectivePermissionPreset: PERMISSION_PRESET_REQUEST_REVIEW, effectiveGrants: {
+      allow: ['read_file(' + cwd + ')'], deny: ['write_file(*)', 'command(*)', 'unsandboxed(*)', 'mcp(*)', 'execute_url(*)', 'download_url(*)']
+    }}
+  }
+}
+
+const AUTO_APPROVE_KINDS = new Set(['permission', 'filePermission', 'runCommand', 'mcp', 'approvalInteraction'])
+/** Full access must not wait on a human: answer approval prompts that slip through, scoped to this conversation. */
+export function autoApprovalPayload(interaction) {
+  if (!interaction || !AUTO_APPROVE_KINDS.has(interaction.kind)) return null
+  const options = interaction.options || []
+  const pick = options.find(o => o.id === 'conversation') || options.find(o => o.id === 'once') || options.find(o => o.id === 'allow')
+  return pick?.payload || null
+}
+
+const generatorCounts = new Map()
+
+/** Newest context window reading for a desktop conversation. Fetches only generator rows added since the last read. */
+export async function readDesktopContext(cascadeId, rpc, signal) {
+  if (!cascadeId) return null
+  if (!rpc) {
+    const app = desktopApp()
+    rpc = app ? await findDesktop(app).catch(() => null) : null
+    if (!rpc) return null
+  }
+  const timeout = AbortSignal.timeout(6000)
+  const sig = signal ? AbortSignal.any([signal, timeout]) : timeout
+  const known = generatorCounts.get(cascadeId) || 0
+  let offset = Math.max(0, known - 1)
+  let list = (await rpc('GetCascadeTrajectoryGeneratorMetadata', {cascadeId, generatorMetadataOffset: offset}, sig)).generatorMetadata || []
+  if (!list.length && offset > 0) {
+    offset = 0
+    list = (await rpc('GetCascadeTrajectoryGeneratorMetadata', {cascadeId, generatorMetadataOffset: 0}, sig)).generatorMetadata || []
+  }
+  generatorCounts.set(cascadeId, offset + list.length)
+  return antigravityContextFromGenerators(list)
+}
+
+function emitDesktopContext(emit, rpc, cascadeId, signal) {
+  return readDesktopContext(cascadeId, rpc, signal)
+    .then(usage => emit('context', {sessionId: cascadeId, sessionFile: antigravitySessionFile(cascadeId), ...(usage || {})}))
+    .catch(() => {})
+}
+
+export async function runDesktopTurn({app, cwd, projectName = '', session, prompt, historyPrompt, title, titleLocked = false, images = [], model, effort, write, accessMode, signal, emit, rpc}) {
+  const access = accessMode || (write ? 'workspace' : 'read-only')
   if (session) stopWatchingDesktopCallbacks(session)
   rpc ??= await connect(app, signal)
   const selected = await modelFor(rpc, model, effort, signal)
@@ -515,12 +599,8 @@ export async function runDesktopTurn({app, cwd, projectName = '', session, promp
   }
   if (titleLocked && title && (id !== session || title !== previous?.annotations?.title)) await rpc('UpdateConversationAnnotations', {cascadeIds:[id], annotations:{title}, mergeAnnotations:true}, signal)
   emit('log', '已连接 Antigravity 项目会话' + (selected ? ' · ' + selected.label : ''))
-  const toolConfig = write ? {} : {
-    autoInteractionBehavior:2,
-    permissionConfig:{permissionsV2:true, effectivePermissionPreset:2, effectiveGrants:{
-      allow:['read_file(' + cwd + ')'], deny:['write_file(*)','command(*)','unsandboxed(*)','mcp(*)','execute_url(*)','download_url(*)']
-    }}
-  }
+  const toolConfig = desktopToolConfig(access, cwd)
+  const autoApproved = new Set()
   const messageId = randomUUID()
   const plannerConfig = {toolConfig, ...(selected ? {requestedModel:selected.modelOrAlias} : {})}
   const imageMedia = images.filter(x => x.isImage !== false && String(x.mimeType || '').startsWith('image/'))
@@ -538,7 +618,10 @@ export async function runDesktopTurn({app, cwd, projectName = '', session, promp
     sending = true
     await rpc('SendUserCascadeMessage', body, signal)
     const sentAt = Date.now()
+    let lastContextAt = 0
+    void emitDesktopContext(emit, rpc, id, signal)
     for (;;) {
+      if (Date.now() - lastContextAt > 3000) { lastContextAt = Date.now(); void emitDesktopContext(emit, rpc, id, signal) }
       const summary = (await summaries())[id]
       if (!summary) throw Error('Antigravity 会话已经不可用。')
       const trajectoryId = summary.trajectoryId || id
@@ -572,6 +655,18 @@ export async function runDesktopTurn({app, cwd, projectName = '', session, promp
             const waiting = isWaitingStep(step) || Boolean(step.requestedInteraction)
             if (waiting) {
               const interaction = buildAgInteraction(step, idx, id, trajectoryId)
+              const approval = access === 'full' ? autoApprovalPayload(interaction) : null
+              if (approval) {
+                if (!autoApproved.has(idx)) {
+                  autoApproved.add(idx)
+                  stepStates.set(idx, 'running')
+                  const item = buildAgToolStep(step, idx, 'running')
+                  if (item) emit('log', '::step::' + JSON.stringify({ ...item, interaction: null }))
+                  await rpc('HandleCascadeUserInteraction', {cascadeId: id, interaction: {trajectoryId, stepIndex: idx, ...approval}}, signal)
+                    .catch(() => autoApproved.delete(idx))
+                }
+                continue
+              }
               const sig = 'waiting:' + interaction.kind + ':' + (interaction.target || '')
               if (stepStates.get(idx) !== sig) {
                 const baseItem = buildAgToolStep(step, idx, 'waiting') || { id: 'ag-' + idx, kind: 'tool', title: interaction.title, status: 'waiting' }
@@ -621,6 +716,7 @@ export async function runDesktopTurn({app, cwd, projectName = '', session, promp
       }
       await delay(750, null, {signal})
     }
+    await emitDesktopContext(emit, rpc, id)
     if (lastError || !output) throw Error(lastError || 'Antigravity 已结束本轮，未返回正文。')
     if (!nextUser) {
       watchDesktopCallbacks({
@@ -631,7 +727,8 @@ export async function runDesktopTurn({app, cwd, projectName = '', session, promp
         onFollowup: (type, value) => emit(type, value),
         rpc: rpc,
         initialRunning: stepStates.size > 0,
-        stepCount: lastSeenCount
+        stepCount: lastSeenCount,
+        accessMode: access
       })
     }
   } finally {

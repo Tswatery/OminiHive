@@ -364,3 +364,24 @@ test('并发完成顺序不同时归档文件名保持稳定，旧文件被清�
     rmSync(base, { recursive: true, force: true })
   }
 })
+
+test('回复消息记录原生会话 ID，便于去客户端查找',()=>{
+  const base=mkdtempSync(path.join(tmpdir(),'hive-sid-'))
+  try{
+    const folder=path.join(base,'project');mkdirSync(folder)
+    const store=new Store(path.join(base,'hive.sqlite'))
+    store.project(folder)
+    const room=store.tree().rooms[0].id
+    const [run]=store.startBatch(room,'@Codex 看看','Codex')
+    store.record(run.id,room,'Codex','session','thread-abc')
+    const reply=store.messages(room).find(m=>m.id===run.id)
+    assert.equal(reply.session,'thread-abc')
+    assert.equal(store.tree().sessions.find(s=>s.room===room).native,'thread-abc')
+    const synced=store.insertSyncedMessage(room,'Codex','外部回复','同步自 Codex 客户端',Date.now(),'thread-abc')
+    assert.equal(store.messages(room).find(m=>m.id===synced).session,'thread-abc')
+    store.db.close()
+  }finally{
+    try { const d = path.join(base, 'project', '.ominihive', 'context'); chmodSync(d, 0o755); for (const n of readdirSync(d)) chmodSync(path.join(d, n), 0o755) } catch {}
+    rmSync(base,{recursive:true,force:true})
+  }
+})

@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { Check, ChevronLeft, ChevronRight, Copy, ExternalLink, FolderSearch, Image as ImageIcon, Link2, PanelRight, X, ZoomIn, ZoomOut } from 'lucide-react'
 import { friendlyDir, friendlyFileName, imageMetaLine } from './filePresentation'
+import { writeClipboardText } from './clipboard'
 
 export type LightboxImageItem = {
   path: string
@@ -175,7 +176,7 @@ export function ImageLightbox({
   onClose: () => void
   onOpenInSidePanel?: (path: string) => void
   onFileContextMenu?: (e: React.MouseEvent, absPath: string, allowPreview?: boolean, extra?: { dataUrl?: string }) => void
-  onToast?: (message: string) => void
+  onToast?: (message: string, kind?: 'ok' | 'error') => void
 }) {
   const safeIndex = Math.max(0, Math.min(index, items.length - 1))
   const current = items[safeIndex]
@@ -333,7 +334,7 @@ export function ImageLightbox({
 
   function copyPath() {
     if (!absPath) return
-    void navigator.clipboard.writeText(absPath)
+    void writeClipboardText(absPath)
     setCopied(true)
     setTimeout(() => setCopied(false), 1500)
   }
@@ -344,9 +345,9 @@ export function ImageLightbox({
       await copyImageToClipboard({ dataUrl: resolved.dataUrl })
       setImageCopied(true)
       setTimeout(() => setImageCopied(false), 1500)
-      onToast?.('已复制图片')
+      onToast?.('已复制图片', 'ok')
     } catch (err) {
-      onToast?.(err instanceof Error ? err.message : '无法复制该图片')
+      onToast?.(err instanceof Error ? err.message : '无法复制该图片', 'error')
     }
   }
   copyImageRef.current = copyImage

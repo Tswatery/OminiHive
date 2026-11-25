@@ -7,6 +7,8 @@ import 'katex/dist/katex.min.css'
 import { Check, Copy, ExternalLink, FileText } from 'lucide-react'
 import { LocalImageThumb, type LightboxImageItem } from './ImageLightbox'
 import { preprocessMathDelimiters } from './markdownMath'
+import { remarkHtmlBr } from './remarkHtmlBr'
+import { writeClipboardText } from './clipboard'
 
 const TOKEN_RE = /(\/\/.*$|#.*$|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\b(?:const|let|var|function|return|if|else|for|while|switch|case|break|continue|import|export|from|default|async|await|try|catch|finally|throw|new|class|extends|implements|interface|type|enum|def|elif|pass|with|as|in|not|and|or|is|None|True|False|true|false|null|undefined|pub|fn|struct|impl|use|mod|match|SELECT|FROM|WHERE|INSERT|INTO|VALUES|UPDATE|SET|DELETE|CREATE|TABLE|JOIN|ON|ORDER|BY|LIMIT|PRAGMA)\b|\b\d+(?:\.\d+)?\b)/gm
 
@@ -32,7 +34,7 @@ function highlightCode(code: string): React.ReactNode[] {
 const CodeBlock = React.memo(function CodeBlock({ lang, code }: { lang: string; code: string }) {
   const [copied, setCopied] = useState(false)
   function copy() {
-    void navigator.clipboard.writeText(code)
+    void writeClipboardText(code)
     setCopied(true)
     setTimeout(() => setCopied(false), 1600)
   }
@@ -119,7 +121,7 @@ function preprocessCitations(md: string): string {
   return out
 }
 
-const REMARK_PLUGINS: React.ComponentProps<typeof Markdown>['remarkPlugins'] = [gfm, remarkMath]
+const REMARK_PLUGINS: React.ComponentProps<typeof Markdown>['remarkPlugins'] = [gfm, remarkMath, remarkHtmlBr]
 const REHYPE_PLUGINS: React.ComponentProps<typeof Markdown>['rehypePlugins'] = [[rehypeKatex, { throwOnError: false, strict: false }]]
 const urlTransform = (url: string) =>
   (url.startsWith('omini-cite://') || url.startsWith('omini-mem://') || /^file:\/\//i.test(url)) ? url : defaultUrlTransform(url)

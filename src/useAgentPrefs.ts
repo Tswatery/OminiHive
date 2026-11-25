@@ -8,6 +8,7 @@ import { loadJson } from './storage'
 export type AgentPrefs = Partial<Record<Agent, {
   model: string
   effort: string
+  fast?: boolean
   write?: boolean
   access?: AccessMode
   provider?: string
@@ -35,6 +36,7 @@ export function useAgentPrefs() {
   const [providers, setProviders] = useState<Partial<Record<Agent, string>>>(() => loadJson('ominihive:providers', {}))
   const [selected, setSelected] = useState<Partial<Record<Agent, string>>>(() => loadJson('ominihive:models', {}))
   const [efforts, setEfforts] = useState<Record<string, string>>(() => loadJson('ominihive:efforts', {}))
+  const [codexFast, setCodexFast] = useState<boolean>(() => Boolean(loadJson<boolean>('ominihive:codex-fast', false)))
   /** key: `${roomId}:${agent}` → next send starts a new native session */
   const [freshSessions, setFreshSessions] = useState<Record<string, boolean>>({})
   const [catalog, setCatalog] = useState<Partial<Record<Agent, ModelOption[]>>>({})
@@ -45,6 +47,7 @@ export function useAgentPrefs() {
   useEffect(() => { localStorage.setItem('ominihive:providers', JSON.stringify(providers)) }, [providers])
   useEffect(() => { localStorage.setItem('ominihive:models', JSON.stringify(selected)) }, [selected])
   useEffect(() => { localStorage.setItem('ominihive:efforts', JSON.stringify(efforts)) }, [efforts])
+  useEffect(() => { localStorage.setItem('ominihive:codex-fast', JSON.stringify(codexFast)) }, [codexFast])
 
   /** Show the cached list immediately, then refresh from the client; stale responses are dropped. */
   async function loadModels(a: Agent) {
@@ -84,6 +87,7 @@ export function useAgentPrefs() {
       prefs[a] = {
         model: m,
         effort: ef,
+        ...(a === 'Codex' ? { fast: codexFast } : {}),
         write: acc !== 'read-only',
         access: acc,
         provider: providers[a] || '',
@@ -98,6 +102,7 @@ export function useAgentPrefs() {
     providers, setProviders,
     selected, setSelected,
     efforts, setEfforts,
+    codexFast, setCodexFast,
     freshSessions, setFreshSessions,
     catalog, hints, loadModels,
     buildPrefs

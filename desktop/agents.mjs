@@ -1,7 +1,7 @@
 import {randomUUID} from 'node:crypto'
 import { promisify } from 'node:util'
 import { spawn,execFile } from 'node:child_process'
-import { existsSync, readFileSync, readdirSync, statSync, accessSync, constants, writeFileSync, unlinkSync } from 'node:fs'
+import { existsSync, realpathSync, readFileSync, readdirSync, statSync, accessSync, constants, writeFileSync, unlinkSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 import { createInterface } from 'node:readline'
@@ -13,6 +13,7 @@ import {antigravityEnv} from './antigravity-env.mjs'
 import {resolveProviderConfig,prepareCodexHome,legacyCodexRollout} from './ccswitch.mjs'
 import {EFFORT_LEVELS,isValidEffort,normalizeModelEfforts,applyReasoningEffort} from './reasoning.mjs'
 import {createStepAdapter} from './step-tracker.mjs'
+import {claudeContextTokens,claudeWindowFromResult,claudeSessionFile,antigravitySessionFile,readCodexTokenUsage} from './context-usage.mjs'
 
 // Every agent CLI runs in its own process group (detached). Track them so app quit can
 // terminate the whole group synchronously instead of leaving orphaned CLIs behind.
@@ -23,6 +24,61 @@ export function killAllAgentProcesses(signal='SIGTERM'){
 export {availability} from './clients.mjs'
 const ordered=EFFORT_LEVELS
 const pendingInteractions=new Map()
+
+export function formatClaudeSystemStep(e) {
+  if (!e || e.type !== 'system') return null
+  if (e.subtype === 'api_error' || e.subtype === 'api_retry') {
+    const errObj = e.error && typeof e.error === 'object' ? e.error : null
+    const status = Number(e.status ?? e.error_status ?? errObj?.status ?? errObj?.statusCode ?? 0) || 0
+    const rawMsg = typeof e.error === 'string'
+      ? e.error.trim()
+      : String(errObj?.formatted || errObj?.message || e.message || '').trim()
+    const attempt = Number(e.retryAttempt ?? e.attempt ?? 0) || 0
+    const max = Number(e.maxRetries ?? e.max_retries ?? 0) || 0
+    const waitMs = Number(e.retryInMs ?? e.retry_delay_ms ?? 0) || 0
+
+    let reason = ''
+    if (status === 408 || /request_body_timeout|request body upload/i.test(rawMsg)) {
+      reason = '408 请求体上传超时（上下文或图片过大）'
+    } else if (status === 429 || /rate.?limit/i.test(rawMsg)) {
+      reason = `${status || 429} 触发限流`
+    } else if (status === 529 || /overloaded/i.test(rawMsg)) {
+      reason = `${status || 529} 上游服务过载`
+    } else if (status >= 500) {
+      reason = `${status} 上游服务异常`
+    } else if (rawMsg) {
+      const clean = rawMsg.replace(/\s+/g, ' ')
+      reason = (status ? `${status} ` : '') + (clean.length > 56 ? clean.slice(0, 56) + '…' : clean)
+    } else {
+      reason = status ? `HTTP ${status}` : '网络或上游异常'
+    }
+
+    const retryTag = attempt > 0 ? ` (${max > 0 ? `${attempt}/${max}` : `第 ${attempt} 次`})` : ''
+    const exhausted = max > 0 && attempt >= max
+    const title = exhausted ? `API 重试失败${retryTag} · ${reason}` : `API 报错重试中${retryTag} · ${reason}`
+
+    const detailParts = []
+    if (rawMsg) detailParts.push(rawMsg.slice(0, 800))
+    if (waitMs > 0 && !exhausted) detailParts.push(`将在 ${(waitMs / 1000).toFixed(1)}s 后自动重试`)
+    if (status === 408 || /request_body_timeout|request body upload/i.test(rawMsg)) {
+      detailParts.push('提示：当前会话累计图片/上下文体积较大，可停止后重置会话或新开讨论。')
+    }
+    return {
+      id: 'claude-api-retry',
+      kind: 'info',
+      title,
+      status: exhausted ? 'error' : 'running',
+      detail: detailParts.length ? detailParts.join('\n') : undefined
+    }
+  }
+  if (e.subtype === 'status' && e.status === 'compacting') {
+    return { id: 'claude-compact', kind: 'info', title: '正在压缩长上下文...', status: 'running' }
+  }
+  if (e.subtype === 'compact_boundary') {
+    return { id: 'claude-compact', kind: 'info', title: '已完成长上下文压缩', status: 'done' }
+  }
+  return null
+}
 
 export function buildDeepSeekArgs({ prompt, accessMode, write, session, patchFile } = {}) {
   const args = ['headless']
@@ -309,7 +365,15 @@ export async function setCodexThreadName(threadId, name) {
   }
 }
 
-export async function execute({agent,cwd,projectName='',prompt,historyPrompt,title,titleLocked=false,images=[],session,write=false,access='',signal,emit,model='',effort='',providerId='',catalogOnly=false}) {
+export function resolveCodexFastTier(catalogData, modelId) {
+  const list = Array.isArray(catalogData) ? catalogData : []
+  const entry = list.find(m => m?.model === modelId) || list.find(m => m?.isDefault) || list[0]
+  const tiers = Array.isArray(entry?.serviceTiers) ? entry.serviceTiers : []
+  const matched = tiers.find(t => t && (/^fast$/i.test(String(t.name || '')) || t.id === 'priority' || t.id === 'fast'))
+  return matched?.id || 'priority'
+}
+
+export async function execute({agent,cwd,projectName='',prompt,historyPrompt,title,titleLocked=false,images=[],session,write=false,access='',signal,emit,model='',effort='',fast=false,providerId='',catalogOnly=false}) {
   const accessMode = (access === 'read-only' || access === 'workspace' || access === 'full') ? access : (write ? 'workspace' : 'read-only')
   write = accessMode !== 'read-only'
   await initClients()
@@ -321,7 +385,7 @@ export async function execute({agent,cwd,projectName='',prompt,historyPrompt,tit
   if (providerId && !provider) throw Error('渠道配置已变化，请重新选择。')
   const gravityApp = agent === 'Antigravity' && !provider && desktopApp()
   if (gravityApp) {
-    return runDesktopTurn({app:gravityApp,cwd,projectName,prompt,historyPrompt,title,titleLocked,session,images,write,model,effort,signal,emit})
+    return runDesktopTurn({app:gravityApp,cwd,projectName,prompt,historyPrompt,title,titleLocked,session,images,write,accessMode,model,effort,signal,emit})
   }
   if (agent === 'Antigravity') emit('log', provider ? '当前渠道使用独立 CLI 会话。' : '未安装 Antigravity 桌面端，使用本机 CLI 会话。')
   const env={...process.env, PATH:dirs.join(':')}
@@ -433,7 +497,11 @@ export async function execute({agent,cwd,projectName='',prompt,historyPrompt,tit
   child.stderr.on('data',data=>{stderr=(stderr+data).slice(-1500)})
   child.on('error',fail)
   child.stdin.on('error',e=>{if(e.code!=='EPIPE')fail(e)})
-  child.on('close',code=>fail(Error('CLI 已退出（'+code+'）'+(stderr? ' '+stderr.slice(-500):''))))
+  child.on('close',code=>{
+    // A clean exit after a successful turn (e.g. while we were waiting on background tasks) is a normal end.
+    if(claudeResultOk && code===0){settleClaudeBgWait('后台任务已结束');finish();return}
+    fail(Error('CLI 已退出（'+code+'）'+(stderr? ' '+stderr.slice(-500):'')))
+  })
   const send=obj=>child.stdin.write(JSON.stringify(codex?obj:{jsonrpc:'2.0',...obj})+'\n')
   function request(method,params){
     if(failure)return Promise.reject(failure)
@@ -491,12 +559,35 @@ export async function execute({agent,cwd,projectName='',prompt,historyPrompt,tit
   const toolSteps=new Map()
   const blockIndexToToolId=new Map()
   const codexReasonBuf=new Map()
-  let claudeThinkSeq=0, claudeThinkId='', claudeThinkBuf='', lastClaudeThinkEmit=0, claudeThinkActive=false
+  let claudeModel=''
+  const claudeCwd=()=>{try{return realpathSync(cwd)}catch{return cwd}}
+  let claudeThinkSeq=0, claudeThinkId='', claudeThinkBuf='', lastClaudeThinkEmit=0, claudeThinkActive=false, claudeApiRetryActive=false
+  // Background work (Bash run_in_background, background sub-agents). `claude -p` keeps running after
+  // the turn's `result` while these are alive, then starts a follow-up turn when they report back,
+  // so the run is only over once a result arrives with nothing left in the background.
+  let claudeBgTasks=[], claudeBgStepId='', claudeBgSeq=0, claudeResultOk=false
+  function claudeBgDetail(){
+    return claudeBgTasks.map(t=>'· '+String(t?.description||t?.task_type||t?.task_id||'后台任务').replace(/\s+/g,' ').slice(0,120)).join('\n')||undefined
+  }
+  function emitClaudeBgWait(){
+    if(!claudeBgStepId)claudeBgStepId='claude-bg-wait-'+(++claudeBgSeq)
+    emitStep({id:claudeBgStepId,kind:'info',title:`后台任务运行中（${claudeBgTasks.length} 个），完成后 Claude 会继续处理`,status:'running',detail:claudeBgDetail()})
+  }
+  function settleClaudeBgWait(title){
+    if(!claudeBgStepId)return
+    emitStep({id:claudeBgStepId,kind:'info',title,status:'done'})
+    claudeBgStepId=''
+  }
   function finishClaudeThink(){
     if(!claudeThinkActive || !claudeThinkId)return
     claudeThinkActive=false
     const detail=claudeThinkBuf.trim()
     emitStep({id:claudeThinkId,kind:'thought',title:'思考过程',status:'done',detail:detail?detail.slice(-2000):undefined})
+  }
+  function clearClaudeRetry(){
+    if(!claudeApiRetryActive)return
+    claudeApiRetryActive=false
+    emitStep({id:'claude-api-retry',kind:'info',title:'API 连接已恢复',status:'done'})
   }
   if(provider)emitStep({id:'meta-provider',kind:'info',title:'渠道 · '+provider.name,status:'done'})
   function append(s){if(s){output+=s;emit('text',s)}}
@@ -540,8 +631,32 @@ export async function execute({agent,cwd,projectName='',prompt,historyPrompt,tit
     let e; try{e=JSON.parse(line)}catch{return}
     const p=e.params??{}
     if(claude || workbuddy){
-      if(e.type==='system'&&e.subtype==='init'){emit('session',e.session_id);if(e.model)emitStep({id:'meta-model',kind:'info',title:'模型 · '+e.model,status:'done'})}
+      if(e.type==='system'){
+        if(e.subtype==='init'){
+          emit('session',e.session_id);if(e.model)emitStep({id:'meta-model',kind:'info',title:'模型 · '+e.model,status:'done'})
+          if(claude){claudeModel=e.model||'';emit('context',{sessionId:e.session_id,sessionFile:claudeSessionFile(claudeCwd(),e.session_id),model:claudeModel})}
+        }
+        else if(e.subtype==='background_tasks_changed' && Array.isArray(e.tasks)){
+          claudeBgTasks=e.tasks
+          if(claudeBgStepId){
+            if(claudeBgTasks.length)emitClaudeBgWait()
+            else settleClaudeBgWait('后台任务已完成，Claude 继续处理')
+          }
+        }
+        else {
+          const sysStep=formatClaudeSystemStep(e)
+          if(sysStep){
+            if(sysStep.id==='claude-api-retry')claudeApiRetryActive=sysStep.status==='running'
+            emitStep(sysStep)
+          }
+        }
+      }
       const block=e.event
+      if(claude && !e.parent_tool_use_id && block?.type==='message_start'){
+        const used=claudeContextTokens(block.message?.usage)
+        if(used)emit('context',{usedTokens:used})
+      }
+      if(block?.type==='content_block_start'||block?.type==='content_block_delta')clearClaudeRetry()
       if(block?.type==='content_block_start'&&block.content_block?.type==='thinking'){
         claudeThinkId='claude-think-'+(++claudeThinkSeq)
         claudeThinkBuf=typeof block.content_block.thinking==='string'?block.content_block.thinking:''
@@ -602,6 +717,8 @@ export async function execute({agent,cwd,projectName='',prompt,historyPrompt,tit
         }
       }
       if(e.type==='assistant'&&Array.isArray(e.message?.content)){
+        clearClaudeRetry()
+        if(claude && !e.parent_tool_use_id){const used=claudeContextTokens(e.message?.usage);if(used)emit('context',{usedTokens:used})}
         for(const c of e.message.content){
           if(c.type==='thinking' && typeof c.thinking==='string' && c.thinking.trim()){
             const tid=claudeThinkId||('claude-think-'+(++claudeThinkSeq))
@@ -635,8 +752,15 @@ export async function execute({agent,cwd,projectName='',prompt,historyPrompt,tit
       }
       if(e.type==='result'){
         finishClaudeThink()
-        if(e.is_error)fail(Error(e.result||e.errors?.join('\n')||(workbuddy?'WorkBuddy 执行失败':'Claude 执行失败')))
-        else {if(!output)append(e.result);finish()}
+        if(claude){const w=claudeWindowFromResult(e.modelUsage,claudeModel);if(w)emit('context',{windowTokens:w})}
+        if(!e.is_error)clearClaudeRetry()
+        if(e.is_error){settleClaudeBgWait('后台任务等待中断');fail(Error(e.result||e.errors?.join('\n')||(workbuddy?'WorkBuddy 执行失败':'Claude 执行失败')))}
+        else {
+          if(!output)append(e.result)
+          claudeResultOk=true
+          if(claude && claudeBgTasks.length)emitClaudeBgWait()
+          else {settleClaudeBgWait('后台任务已完成');finish()}
+        }
       }
       return
     }
@@ -788,6 +912,9 @@ export async function execute({agent,cwd,projectName='',prompt,historyPrompt,tit
         const now=Date.now()
         if(now-lastThoughtEmit>450){lastThoughtEmit=now;emitStep({id:'ag-thought',kind:'thought',title:'正在思考',status:'running',detail:thoughtBuf})}
       }
+      if(u.sessionUpdate==='usage_update' && agent==='Antigravity'){
+        emit('context',{usedTokens:u.used,windowTokens:u.size})
+      }
       if(u.sessionUpdate==='agent_message_chunk'){
         if(thoughtBuf){emitStep({id:'ag-thought',kind:'thought',title:'思考过程',status:'done',detail:thoughtBuf});thoughtBuf=''}
         append(u.content?.text)
@@ -800,6 +927,10 @@ export async function execute({agent,cwd,projectName='',prompt,historyPrompt,tit
     }
     const evThread=p.threadId||p.thread?.id||''
     const isSubThread=Boolean(codex && codexThreadId && evThread && evThread!==codexThreadId)
+    if(codex && e.method==='thread/tokenUsage/updated' && !isSubThread){
+      const usage=readCodexTokenUsage(p)
+      if(usage)emit('context',usage)
+    }
     if(e.method==='item/reasoning/summaryTextDelta'||e.method==='item/reasoning/textDelta'){
       if(isSubThread)return
       const rid=p.itemId||'codex-reason'
@@ -918,7 +1049,8 @@ export async function execute({agent,cwd,projectName='',prompt,historyPrompt,tit
       const codexProject=await ensureCodexProject(request,cwd,projectName).catch(()=>null)
       const codexProjectId=codexProject?.projectId||''
       const codexSandbox=accessMode==='full'?'danger-full-access':(accessMode==='workspace'?'workspace-write':'read-only')
-      const opts={cwd,...(defaultModel?{model:defaultModel}:{}),sandbox:codexSandbox,approvalPolicy:'never'}
+      const codexFastTier=fast?resolveCodexFastTier(catalog.data,defaultModel):''
+      const opts={cwd,...(defaultModel?{model:defaultModel}:{}),...(codexFastTier?{serviceTier:codexFastTier}:{}),sandbox:codexSandbox,approvalPolicy:'never'}
       const resumeCodex=async params=>{
         for(let attempt=0;;attempt++){
           try{ return await request('thread/resume',params) }
@@ -946,6 +1078,7 @@ export async function execute({agent,cwd,projectName='',prompt,historyPrompt,tit
       }else result=await request('thread/start',{...opts,...(codexProjectId?{projectId:codexProjectId}:{})})
       if(result.model)emit('log','模型 · '+result.model)
       const id=result.thread.id;codexThreadId=id;emit('session',id);active=true
+      emit('context',{sessionId:id,sessionFile:result.thread?.path||'',model:result.model||defaultModel||''})
       // Only bind threads that have no project yet, so a thread the user moved in Codex App stays where they put it.
       if(codexProjectId && !result.thread?.projectId){
         await request('thread/metadata/update',{threadId:id,projectId:codexProjectId}).catch(()=>{})
@@ -957,11 +1090,13 @@ export async function execute({agent,cwd,projectName='',prompt,historyPrompt,tit
             ? {type:'workspaceWrite',writableRoots:[cwd],networkAccess:true,excludeTmpdirEnvVar:false,excludeSlashTmp:false}
             : {type:'readOnly',networkAccess:false})
       if(effort)emit('log','请求思考强度 · '+effort)
+      if(codexFastTier)emit('log','Fast 模式 · 已开启')
       const codexImages=images.filter(i=>i.isImage!==false && String(i.mimeType||'').startsWith('image/'))
       const codexFiles=images.filter(i=>!codexImages.includes(i))
       const codexText=codexFiles.length?prompt+'\n\n[用户附带了以下文件，请按需读取：\n'+codexFiles.map(f=>`${f.name}: ${f.path}`).join('\n')+'\n]':prompt
       const codexInput=[{type:'text',text:codexText,text_elements:[]},...codexImages.map(i=>({type:'localImage',path:i.path}))]
-      const turnRes=await request('turn/start',{threadId:id,cwd,...(turnEffort?{effort:turnEffort}:{}),...(defaultModel?{model:defaultModel}:{}),approvalPolicy:'never',sandboxPolicy,input:codexInput})
+      const turnTier=codexFastTier?{serviceTier:codexFastTier}:{serviceTierForTurn:'default'}
+      const turnRes=await request('turn/start',{threadId:id,cwd,...(turnEffort?{effort:turnEffort}:{}),...(defaultModel?{model:defaultModel}:{}),...turnTier,approvalPolicy:'never',sandboxPolicy,input:codexInput})
       codexTurnId=turnRes?.turn?.id||turnRes?.turnId||''
       await done
     }else{
@@ -983,6 +1118,7 @@ export async function execute({agent,cwd,projectName='',prompt,historyPrompt,tit
       await request('session/set_mode',{sessionId:id,modeId:write?'auto':'plan'}).catch(()=>request('session/set_mode',{sessionId:id,modeId:'plan'}).catch(()=>{}))
       if(session)await new Promise(r=>setTimeout(r,150))
       emit('session',id);active=true
+      if(agent==='Antigravity'){const f=antigravitySessionFile(id);emit('context',{sessionId:id,...(existsSync(f)?{sessionFile:f}:{})})}
       const agImages=images.filter(i=>i.isImage!==false && String(i.mimeType||'').startsWith('image/'))
       const agFiles=images.filter(i=>!agImages.includes(i))
       const agText=agFiles.length?prompt+'\n\n[用户附带了以下文件，请按需读取：\n'+agFiles.map(f=>`${f.name}: ${f.path}`).join('\n')+'\n]':prompt

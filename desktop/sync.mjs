@@ -440,7 +440,7 @@ export async function syncRoomExternal(store, roomId, busyAgents = new Set()) {
 
       const author = t.role === 'user' ? '我' : agent
       const body = t.role === 'user' ? `@${agent} ${cleanText}` : t.text.trim()
-      store.insertSyncedMessage(roomId, author, body, `同步自 ${agent} 客户端`, t.time || Date.now())
+      store.insertSyncedMessage(roomId, author, body, `同步自 ${agent} 客户端`, t.time || Date.now(), nativeId)
       if (fp) knownFingerprints.add(fp)
       knownNormTexts.add(shortKey)
       if (t.role === 'assistant') knownAssistantBodies.push(cleanText)

@@ -3,8 +3,8 @@ const api = {}
 for (const key of [
   'tree', 'messages', 'messagesDelta', 'syncRoom', 'add', 'room', 'renameProject', 'renameRoom', 'externalSessions', 'searchCodexSessions', 'importSharedChat', 'importSession',
   'send', 'stop', 'remove',
-  'cachedModels', 'models', 'clients', 'ccSwitch', 'updates', 'upgrade', 'openExternal', 'openPath', 'revealPath', 'copyImage',
-  'volcQuota', 'volcLogin', 'files', 'gitStatus', 'previewFile', 'agentSkills',
+  'cachedModels', 'models', 'clients', 'ccSwitch', 'updates', 'upgrade', 'openExternal', 'openPath', 'revealPath', 'resolvePath', 'copyImage', 'copyText',
+  'volcQuota', 'volcLogin', 'agentQuota', 'agentQuotaCached', 'contextUsage', 'files', 'gitStatus', 'previewFile', 'agentSkills',
   'respondInteraction', 'focusAntigravity', 'setTheme'
 ]) {
   api[key] = (...args) => ipcRenderer.invoke(key, ...args)

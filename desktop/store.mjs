@@ -136,6 +136,8 @@ export class Store {
     try { this.db.exec('ALTER TABLE messages ADD COLUMN duration INTEGER DEFAULT 0') } catch {}
     try { this.db.exec("ALTER TABLE messages ADD COLUMN attachments TEXT DEFAULT ''") } catch {}
     try { this.db.exec('ALTER TABLE sessions ADD COLUMN last_seen_rowid INTEGER DEFAULT 0') } catch {}
+    // Native client session (Codex thread / Claude session / Antigravity cascade) a reply belongs to.
+    try { this.db.exec("ALTER TABLE messages ADD COLUMN session TEXT DEFAULT ''") } catch {}
     try { this.db.exec('ALTER TABLE rooms ADD COLUMN title_locked INTEGER DEFAULT 0') } catch {}
     // 0 = derived from the first message, 1 = synced from a native client, 2 = AI-generated summary.
     try { this.db.exec('ALTER TABLE rooms ADD COLUMN title_auto INTEGER DEFAULT 0') } catch {}
@@ -225,8 +227,8 @@ export class Store {
         const log = t.role === 'user' ? '' : shared ? '从分享链接导入' : `导入自 ${agent} 客户端\n`
         const ts = Number(t.time) || (now + i)
         this.run(
-          'INSERT INTO messages(id,room,author,body,log,status,time,duration,attachments) VALUES(?,?,?,?,?,?,?,?,?)',
-          msgId, roomId, author, body, log, '完成', ts, 0, ''
+          'INSERT INTO messages(id,room,author,body,log,status,time,duration,attachments,session) VALUES(?,?,?,?,?,?,?,?,?,?)',
+          msgId, roomId, author, body, log, '完成', ts, 0, '', t.role === 'user' ? '' : String(nativeId || '')
         )
         insertedIds.push(msgId)
       }
@@ -249,7 +251,7 @@ export class Store {
     return {
       projects: this.all('SELECT * FROM projects ORDER BY rowid'),
       rooms: this.all('SELECT * FROM rooms ORDER BY rowid DESC'),
-      sessions: this.all('SELECT room, agent FROM sessions')
+      sessions: this.all('SELECT room, agent, native FROM sessions')
     }
   }
 
@@ -265,7 +267,8 @@ export class Store {
   messagesDelta(room, known = {}) {
     const sigs = this.all(
       `SELECT id, status || ':' || COALESCE(duration,0) || ':' || length(CAST(body AS BLOB)) || ':' ||
-              length(CAST(log AS BLOB)) || ':' || length(CAST(COALESCE(attachments,'') AS BLOB)) AS sig
+              length(CAST(log AS BLOB)) || ':' || length(CAST(COALESCE(attachments,'') AS BLOB)) || ':' ||
+              COALESCE(session,'') AS sig
        FROM messages WHERE room=? ORDER BY rowid`,
       room
     )
@@ -454,7 +457,7 @@ export class Store {
       const hasMessages = this.get('SELECT 1 FROM messages WHERE room=? LIMIT 1', room)
       if (!hasMessages) this.run('UPDATE rooms SET title=? WHERE id=? AND COALESCE(title_locked,0)=0', summarizeTitle(task), room)
       const userMsgId = randomUUID()
-      const userInsert = this.run('INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?)', userMsgId, room, '我', displayText, '', '完成', now, 0, attJson)
+      const userInsert = this.run('INSERT INTO messages(id,room,author,body,log,status,time,duration,attachments) VALUES(?,?,?,?,?,?,?,?,?)', userMsgId, room, '我', displayText, '', '完成', now, 0, attJson)
       const seenRowid = Number(userInsert.lastInsertRowid) || 0
       const roomMeta = this.get('SELECT title, COALESCE(title_locked, 0) AS title_locked FROM rooms WHERE id=?', room)
       const title = roomMeta?.title || ''
@@ -475,7 +478,7 @@ export class Store {
             detail: contextMeta.detail
           }) + '\n'
         }
-        this.run('INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?)', id, room, agent, '', initLog, '执行中', now + i + 1, 0, '')
+        this.run('INSERT INTO messages(id,room,author,body,log,status,time,duration,attachments) VALUES(?,?,?,?,?,?,?,?,?)', id, room, agent, '', initLog, '执行中', now + i + 1, 0, '')
         runs.push({
           id,
           agent,
@@ -540,6 +543,7 @@ export class Store {
            native = excluded.native`,
         room, agent, value
       )
+      if (id && value) this.run('UPDATE messages SET session=? WHERE id=?', String(value), id)
       return
     }
     if (!value) return
@@ -628,11 +632,11 @@ export class Store {
     return this.all('SELECT agent, native FROM sessions WHERE room=?', room)
   }
 
-  insertSyncedMessage(room, author, body, log = '', time = Date.now()) {
+  insertSyncedMessage(room, author, body, log = '', time = Date.now(), session = '') {
     const id = randomUUID()
     this.run(
-      'INSERT INTO messages(id,room,author,body,log,status,time,duration,attachments) VALUES(?,?,?,?,?,?,?,?,?)',
-      id, room, author, body, log ? log + '\n' : '', '完成', time, 0, ''
+      'INSERT INTO messages(id,room,author,body,log,status,time,duration,attachments,session) VALUES(?,?,?,?,?,?,?,?,?,?)',
+      id, room, author, body, log ? log + '\n' : '', '完成', time, 0, '', author === '我' ? '' : String(session || '')
     )
     this.syncArchive(room)
     return id

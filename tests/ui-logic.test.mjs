@@ -286,3 +286,31 @@ test('markdown math pipeline renders inline and block LaTeX formulas via KaTeX w
   assert.doesNotMatch(inlineCode, /class="katex"/)
   assert.match(inlineCode, /<code>\$1\/\(N\+1\)\$<\/code>/)
 })
+
+test('remarkHtmlBr renders <br> tags in tables and paragraphs while keeping code and other HTML safe', async () => {
+  const React = (await import('react')).default
+  const { renderToStaticMarkup } = await import('react-dom/server')
+  const Markdown = (await import('react-markdown')).default
+  const gfm = (await import('remark-gfm')).default
+  const { remarkHtmlBr } = await import('../src/remarkHtmlBr.ts')
+
+  const render = md => renderToStaticMarkup(React.createElement(Markdown, {
+    remarkPlugins: [gfm, remarkHtmlBr]
+  }, md))
+
+  const tableHtml = render([
+    '| 幕次 | 要点 |',
+    '| --- | --- |',
+    '| **第一幕：破题与亮底牌<br>**《车企》 | 开局先给结论。<br>· **给领导**：痛点<br/>· **亮肌肉**：实绩 |'
+  ].join('\n'))
+  assert.match(tableHtml, /<br\s*\/>/)
+  assert.doesNotMatch(tableHtml, /&lt;br\s*\/?&gt;/i)
+
+  const variants = render('第一行<br />第二行<BR><br/>第三行')
+  assert.equal((variants.match(/<br\s*\/>/g) || []).length, 3)
+
+  const safeCode = render('行内 `<br>` 与 <span>raw</span>\n\n```html\n<br>\n```')
+  assert.match(safeCode, /<code>&lt;br&gt;<\/code>/)
+  assert.match(safeCode, /&lt;span&gt;raw&lt;\/span&gt;/)
+  assert.doesNotMatch(safeCode, /<br\s*\/>/)
+})

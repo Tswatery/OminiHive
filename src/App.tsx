@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client'
 import {
   Folder, FolderPlus, FolderOpen, MessageSquare, Plus, ArrowUp, Square,
   PanelLeft, Compass, Copy, Check,
-  RotateCcw, Sparkles, ChevronRight, ChevronDown, ChevronUp, X, Forward, Users, FileText, UserPlus, ExternalLink, Sun, Moon, Pencil, Eye, FolderSearch, Image as ImageIcon
+  RotateCcw, Sparkles, ChevronRight, ChevronDown, ChevronUp, X, Hash, Users, FileText, UserPlus, ExternalLink, Sun, Moon, Pencil, Eye, FolderSearch, Image as ImageIcon
 } from 'lucide-react'
 import { Theme, Button } from '@radix-ui/themes'
 import '@radix-ui/themes/styles.css'
@@ -22,6 +22,10 @@ import { ImportSessionModal, type ExternalSessionItem } from './ImportSessionMod
 import { OverlayScrollbar, ScrollArea } from './OverlayScrollbar'
 import { ExecutionTimeline, InlineStepGroup, ProjectDirContext, buildTimelineSegments, formatDuration, parseStepsWithMeta } from './ExecutionTimeline'
 import { ChatHeader } from './ChatHeader'
+import { Tip } from './Tip'
+import { AgentQuota } from './AgentQuota'
+import { ContextInline } from './ContextMeter'
+import type { ContextUsage, ProviderQuota } from './usageFormat'
 import { ComposerToolbar, type AccessMode } from './ComposerToolbar'
 import { cleanError } from './errors'
 import { loadJson } from './storage'
@@ -31,13 +35,14 @@ import { SendQueueBar } from './SendQueueBar'
 import { TypewriterTitle, isAutoTitle } from './TypewriterTitle'
 import './tokens.css'
 import './style.css'
+import { writeClipboardText } from './clipboard'
 
 type Project = { id: string; name: string; dir: string }
 type Room = { id: string; project: string; title: string; title_locked?: number; title_auto?: number }
-type Msg = { id: string; author: string; body: string; log: string; status: string; time: number; duration?: number; attachments?: string }
+type Msg = { id: string; author: string; body: string; log: string; status: string; time: number; duration?: number; attachments?: string; session?: string }
 type ImageDraft = { id: string; name: string; dataUrl: string; isImage: boolean }
 type RunningJob = { room: string; agent: Agent }
-type SessionBinding = { room: string; agent: string }
+type SessionBinding = { room: string; agent: string; native?: string }
 type Tree = { projects: Project[]; rooms: Room[]; agents: Record<Agent, boolean>; running?: RunningJob[]; sessions?: SessionBinding[] }
 type SkillEntry = { id: string; name: string; description: string; source: string; path: string }
 declare global {
@@ -57,6 +62,9 @@ declare global {
       importSession(projectId: string, item: ExternalSessionItem): Promise<string>
       volcQuota(): Promise<QuotaResult>
       volcLogin(): Promise<QuotaResult>
+      agentQuota(force: boolean, provider: ProviderQuota['provider']): Promise<ProviderQuota>
+      agentQuotaCached(): Promise<ProviderQuota[]>
+      contextUsage(roomId: string): Promise<Record<string, ContextUsage>>
       clients(): Promise<ClientInfo[]>
       ccSwitch(): Promise<CCSwitchSummary>
       files(roomId: string, relDir?: string): Promise<FileEntry[]>
@@ -74,7 +82,9 @@ declare global {
       openExternal(url: string): Promise<void>
       openPath(filePath: string, roomId?: string): Promise<boolean>
       copyImage(pngDataUrl: string): Promise<boolean>
+      copyText(text: string): Promise<boolean>
       revealPath(filePath: string, roomId?: string): Promise<boolean>
+      resolvePath(filePath: string, roomId?: string): Promise<string>
       respondInteraction(req: { cascadeId: string; trajectoryId?: string; stepIndex: number; payload: Record<string, unknown> }): Promise<boolean>
       focusAntigravity(): Promise<boolean>
       setTheme(mode: 'light' | 'dark' | 'system'): Promise<boolean>
@@ -334,7 +344,7 @@ const UserBubble = React.memo(function UserBubble({
 
   function copyBody() {
     if (!copyText) return
-    void navigator.clipboard.writeText(copyText)
+    void writeClipboardText(copyText)
     setCopied(true)
     setTimeout(() => setCopied(false), 1500)
   }
@@ -445,22 +455,27 @@ function LiveTimer({ startTime }: { startTime: number }) {
 }
 
 const AgentMessage = React.memo(function AgentMessage({
-  m, roomId, projectDir, isLatest, onStop, onRetry, onContinue, onForward, onPreviewFile, onOpenLightbox, onFileContextMenu
+  m, roomId, projectDir, isLatest, ctx, fallbackSession, onStop, onRetry, onContinue, onPreviewFile, onOpenLightbox, onFileContextMenu
 }: {
   m: Msg
+  /** the room's current native session for this agent, for replies saved before messages carried one */
+  fallbackSession?: string
+  /** context window reading, passed only to the newest message of each agent */
+  ctx?: ContextUsage
   roomId: string
   projectDir?: string
   isLatest?: boolean
   onStop: (agent: Agent) => void
   onRetry: (agent: Agent, msgId: string) => void
   onContinue: (agent: Agent) => void
-  onForward: (from: string, to: Agent, body: string) => void
   onPreviewFile: (targetPath: string) => void
   onOpenLightbox: (items: LightboxImageItem[], index: number) => void
   onFileContextMenu: (e: React.MouseEvent, absPath: string, allowPreview?: boolean) => void
 }) {
   const [copied, setCopied] = useState(false)
+  const [idCopied, setIdCopied] = useState(false)
   const agent = allAgents.find(a => a === m.author)
+  const sessionId = (m.session || fallbackSession || '').trim()
   const cls = agent ? agentClass[agent] : 'codex'
   const isRunning = m.status === '执行中'
   // 中断 = app quit mid-run (set on startup), 已停止 = user pressed stop; both are "incomplete".
@@ -482,10 +497,21 @@ const AgentMessage = React.memo(function AgentMessage({
   const isCollapsed = isLongReply && (replyExpanded === null ? !isLatest : !replyExpanded)
 
   function copyBody() {
-    void navigator.clipboard.writeText(m.body || m.log)
+    void writeClipboardText(m.body || m.log)
     setCopied(true)
     setTimeout(() => setCopied(false), 1500)
   }
+
+  function copySessionId() {
+    if (!sessionId) return
+    void writeClipboardText(sessionId)
+    setIdCopied(true)
+    setTimeout(() => setIdCopied(false), 1500)
+  }
+
+  const contextTag = metaTags.find(t => t.startsWith('上下文 ')) || ''
+  const plainTags = metaTags.filter(t => t !== contextTag)
+  const durationLabel = !isRunning && !!m.duration && m.duration > 0 ? formatDuration(m.duration) : ''
 
   return (
     <article className={'msg-agent agent-tinted ' + cls + (isRunning ? ' running' : '')} style={agent ? agentTint(agent) : undefined}>
@@ -495,26 +521,30 @@ const AgentMessage = React.memo(function AgentMessage({
       <div className="msg-content">
         <div className="msg-head">
           <strong className="msg-author">{m.author}</strong>
-          <time>
-            {new Date(m.time).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
-            {!isRunning && !!m.duration && m.duration > 0 ? ` · ${formatDuration(m.duration)}` : ''}
-          </time>
-          {metaTags.length > 0 && (contextDetail ? (
-            <button
-              type="button"
-              className={'msg-meta-inline clickable' + (ctxOpen ? ' open' : '')}
-              title={metaTags.join(' · ') + '\n点击查看本轮带入的上下文'}
-              aria-expanded={ctxOpen}
-              onClick={() => setCtxOpen(v => !v)}
-            >
-              <span className="msg-meta-text">{metaTags.join(' · ')}</span>
-              <ChevronDown size={11} className="msg-meta-caret" />
-            </button>
-          ) : (
-            <span className="msg-meta-inline" title={metaTags.join(' · ')}>
-              {metaTags.join(' · ')}
+          <time>{new Date(m.time).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</time>
+          {(durationLabel || plainTags.length > 0 || contextTag) && (
+            <span className="msg-meta" title={[durationLabel, ...metaTags].filter(Boolean).join(' · ')}>
+              {[
+                ...(durationLabel ? [<span key="dur" className="msg-meta-tag duration">{durationLabel}</span>] : []),
+                ...plainTags.map(t => <span key={t} className="msg-meta-tag">{t}</span>)
+              ].flatMap((el, i) => i ? [<span key={'sep' + i} className="msg-meta-sep">·</span>, el] : [el])}
+              {contextTag && (durationLabel || plainTags.length > 0) && <span className="msg-meta-sep">·</span>}
+              {contextTag && (contextDetail ? (
+                <button
+                  type="button"
+                  className={'msg-meta-tag ctx clickable' + (ctxOpen ? ' open' : '')}
+                  title="点击查看本轮带入的上下文"
+                  aria-expanded={ctxOpen}
+                  onClick={() => setCtxOpen(v => !v)}
+                >
+                  {contextTag}
+                  <ChevronDown size={11} className="msg-meta-caret" />
+                </button>
+              ) : (
+                <span className="msg-meta-tag ctx">{contextTag}</span>
+              ))}
             </span>
-          ))}
+          )}
           {syncOnlyLabel && (
             <span className="sync-tag">{syncOnlyLabel}</span>
           )}
@@ -525,38 +555,24 @@ const AgentMessage = React.memo(function AgentMessage({
             </span>
           )}
           {isFailed && <span className={'status-pill ' + (m.status === '失败' ? 'failed' : 'stopped')}>{m.status}</span>}
+          {ctx && agent && <ContextInline usage={ctx} agent={agent} />}
+          <span className="msg-head-spacer" />
+          {sessionId && (
+            <button
+              type="button"
+              className={'msg-session-btn' + (idCopied ? ' done' : '')}
+              onClick={copySessionId}
+              title={`复制 ${m.author} 会话 ID，可在 ${m.author} 客户端中找到这段对话\n${sessionId}`}
+              aria-label="复制会话 ID"
+            >
+              {idCopied ? <Check size={12} /> : <Hash size={12} />}
+              <span>{idCopied ? '已复制' : '会话 ID'}</span>
+            </button>
+          )}
           {isRunning && agent && (
             <button type="button" className="msg-stop-btn" onClick={() => onStop(agent)}>
               <Square size={10} /> 停止
             </button>
-          )}
-          {!isRunning && (
-            <div className="msg-actions">
-              {m.body && (
-                <button type="button" onClick={copyBody} title="复制回复">
-                  {copied ? <Check size={13} /> : <Copy size={13} />}
-                  <span>{copied ? '已复制' : '复制'}</span>
-                </button>
-              )}
-              {isIncomplete && agent && (
-                <>
-                  <button type="button" onClick={() => onContinue(agent)} title="恢复会话继续执行">
-                    <ArrowUp size={13} />
-                    <span>继续</span>
-                  </button>
-                  <button type="button" onClick={() => onRetry(agent, m.id)} title="重新执行该任务">
-                    <RotateCcw size={13} />
-                    <span>重试</span>
-                  </button>
-                </>
-              )}
-              {m.body && coreAgents.filter(a => a !== m.author).map(other => (
-                <button key={other} type="button" onClick={() => onForward(m.author, other, m.body)} title={'转给 ' + other}>
-                  <Forward size={12} />
-                  <span>给 {other}</span>
-                </button>
-              ))}
-            </div>
           )}
         </div>
 
@@ -667,6 +683,29 @@ const AgentMessage = React.memo(function AgentMessage({
             )}
           </>
         )}
+
+        {!isRunning && (m.body || (isIncomplete && agent)) && (
+          <div className={'msg-foot' + (isLatest ? ' pinned' : '')}>
+            {m.body && (
+              <button type="button" onClick={copyBody} title="复制回复">
+                {copied ? <Check size={13} /> : <Copy size={13} />}
+                <span>{copied ? '已复制' : '复制'}</span>
+              </button>
+            )}
+            {isIncomplete && agent && (
+              <>
+                <button type="button" onClick={() => onContinue(agent)} title="恢复会话继续执行">
+                  <ArrowUp size={13} />
+                  <span>继续</span>
+                </button>
+                <button type="button" onClick={() => onRetry(agent, m.id)} title="重新执行该任务">
+                  <RotateCcw size={13} />
+                  <span>重试</span>
+                </button>
+              </>
+            )}
+          </div>
+        )}
       </div>
     </article>
   )
@@ -674,6 +713,9 @@ const AgentMessage = React.memo(function AgentMessage({
   prev.roomId === next.roomId &&
   prev.projectDir === next.projectDir &&
   prev.isLatest === next.isLatest &&
+  prev.ctx === next.ctx &&
+  prev.fallbackSession === next.fallbackSession &&
+  prev.m.session === next.m.session &&
   prev.m.id === next.m.id &&
   prev.m.author === next.m.author &&
   prev.m.body === next.m.body &&
@@ -686,6 +728,7 @@ const AgentMessage = React.memo(function AgentMessage({
 
 function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void }) {
   const [tree, setTree] = useState<Tree>()
+  const [ctxUsage, setCtxUsage] = useState<Record<string, ContextUsage>>({})
   const [room, setRoom] = useState(localStorage.getItem('room') || '')
   const [messages, setMessages] = useState<Msg[]>([])
   const [messagesRoom, setMessagesRoom] = useState('')
@@ -700,7 +743,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
   const [roomTargetsMap, setRoomTargetsMap] = useState<Record<string, Agent[]>>(() => loadJson('ominihive:room-targets', {}))
   const {
     accessModes, setAccessModes, providers, setProviders, selected, setSelected,
-    efforts, setEfforts, freshSessions, setFreshSessions, catalog, hints, loadModels,
+    efforts, setEfforts, codexFast, setCodexFast, freshSessions, setFreshSessions, catalog, hints, loadModels,
     buildPrefs: buildPrefsFor
   } = useAgentPrefs()
   const [inspected, setInspected] = useState<Agent>(() => defaultTargets[0] || 'Codex')
@@ -722,7 +765,8 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
   const [previewErr, setPreviewErr] = useState('')
   const [lightbox, setLightbox] = useState<{ items: LightboxImageItem[]; index: number } | null>(null)
   const [fileMenu, setFileMenu] = useState<{ x: number; y: number; path: string; allowPreview: boolean; isImage: boolean; dataUrl?: string } | null>(null)
-  const [copyToast, setCopyToast] = useState('')
+  const [copyToast, setCopyToast] = useState<{ message: string; kind: 'ok' | 'error' } | null>(null)
+  const showToast = (message: string, kind: 'ok' | 'error' = 'ok') => setCopyToast({ message, kind })
   const [enabledAgents, setEnabledAgents] = useState<Record<string, boolean>>(() => loadJson('ominihive:enabled', { Codex: true, Claude: true, Antigravity: true }))
   const [roomMembersMap, setRoomMembersMap] = useState<Record<string, Agent[]>>(() => loadJson('ominihive:room-members', {}))
   const [membersOpen, setMembersOpen] = useState(false)
@@ -1124,12 +1168,20 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
     let byId = new Map<string, Msg>()
     let sigs: Record<string, string> = {}
     let lastTreeJson = ''
+    let lastCtxJson = ''
+    setCtxUsage({})
     async function refresh() {
       if (inflight) { pending = true; return }
       inflight = true
       try {
-        const [t, delta] = await Promise.all([api.tree(), room ? api.messagesDelta(room, sigs) : Promise.resolve({ ids: [], rows: [] })])
+        const [t, delta, ctx] = await Promise.all([
+          api.tree(),
+          room ? api.messagesDelta(room, sigs) : Promise.resolve({ ids: [], rows: [] }),
+          room ? api.contextUsage(room).catch(() => ({})) : Promise.resolve({})
+        ])
         if (!alive) return
+        const ctxJson = JSON.stringify(ctx)
+        if (ctxJson !== lastCtxJson) { lastCtxJson = ctxJson; setCtxUsage(ctx) }
         const treeJson = JSON.stringify(t)
         if (treeJson !== lastTreeJson) { lastTreeJson = treeJson; setTree(t) }
         const nextById = new Map<string, Msg>()
@@ -1249,6 +1301,17 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
 
   function detectTriggers(val: string, cursor: number | null) {
     const pos = cursor ?? val.length
+    // Caret on (or right after) an @mention inspects that agent: its model, access and context follow.
+    const tokenRe = /@([A-Za-z0-9_-]+)/g
+    for (let mm = tokenRe.exec(val); mm; mm = tokenRe.exec(val)) {
+      const start = mm.index, end = start + mm[0].length
+      if (pos < start) break
+      if (pos <= end) {
+        const hit = agents.find(a => a.toLowerCase() === mm![1].toLowerCase())
+        if (hit) setInspected(hit)
+        break
+      }
+    }
     const before = val.slice(0, pos)
     const m = before.match(/(?:^|\s)@([a-z0-9_-]*)$/i)
     const exactKnown = m && (m[1].toLowerCase() === 'all' || allAgents.some(a => a.toLowerCase() === m[1].toLowerCase()))
@@ -1521,16 +1584,9 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
     void send('@' + a + ' 请继续完成刚才中断或未完成的任务，并给出完整结果。', a)
   }
 
-  function handleForward(from: string, to: Agent, body: string) {
-    updateTargets([to])
-    const snippet = body.slice(0, 600) + (body.length > 600 ? '…' : '')
-    setInput(`请评审上面 ${from} 的结论并给出你的建议：\n> ${snippet.split('\n')[0]}`)
-    textarea.current?.focus()
-  }
-
   useEffect(() => {
     if (!copyToast) return
-    const t = setTimeout(() => setCopyToast(''), 1800)
+    const t = setTimeout(() => setCopyToast(null), copyToast.kind === 'error' ? 2600 : 1800)
     return () => clearTimeout(t)
   }, [copyToast])
 
@@ -1588,17 +1644,25 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
     setFileMenu(null)
     try {
       await copyImageToClipboard({ path: menu.path, dataUrl: menu.dataUrl }, room)
-      setCopyToast('已复制图片')
+      showToast('已复制图片')
     } catch (err) {
-      setCopyToast(cleanError(err))
+      showToast(cleanError(err), 'error')
     }
   }
 
-  function copyAbsPath(absPath: string) {
+  async function copyAbsPath(absPath: string) {
     if (!absPath) return
-    void navigator.clipboard.writeText(absPath)
-    setCopyToast('已复制绝对路径')
     setFileMenu(null)
+    // The main process may find the file under a sub-workspace the agent had cd'ed into.
+    const real = await api.resolvePath(absPath, room).catch(() => '')
+    await writeClipboardText(real || absPath)
+    showToast(real ? '已复制绝对路径' : '已复制路径（文件不存在）')
+  }
+
+  async function openFromMenu(targetPath: string, reveal: boolean) {
+    setFileMenu(null)
+    const ok = await (reveal ? api.revealPath(targetPath, room) : api.openPath(targetPath, room)).catch(() => false)
+    if (!ok) showToast('找不到文件：' + targetPath.split('/').slice(-2).join('/'), 'error')
   }
 
   function handleOpenLightbox(items: LightboxImageItem[], index: number) {
@@ -1609,12 +1673,11 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
   // AgentMessage is memoized and ignores callback identity, so hand it stable wrappers
   // that always call the latest handlers (otherwise retry/continue on an old message
   // would send with stale access modes / models captured at that message's last render).
-  const latestHandlers = useRef({ handleRetry, handleContinue, handleForward, handlePreviewFile, handleOpenLightbox, handleFileContextMenu })
-  latestHandlers.current = { handleRetry, handleContinue, handleForward, handlePreviewFile, handleOpenLightbox, handleFileContextMenu }
+  const latestHandlers = useRef({ handleRetry, handleContinue, handlePreviewFile, handleOpenLightbox, handleFileContextMenu })
+  latestHandlers.current = { handleRetry, handleContinue, handlePreviewFile, handleOpenLightbox, handleFileContextMenu }
   const messageHandlers = useMemo(() => ({
     onRetry: (a: Agent, msgId: string) => latestHandlers.current.handleRetry(a, msgId),
     onContinue: (a: Agent) => latestHandlers.current.handleContinue(a),
-    onForward: (from: string, to: Agent, body: string) => latestHandlers.current.handleForward(from, to, body),
     onPreviewFile: (targetPath: string) => { void latestHandlers.current.handlePreviewFile(targetPath) },
     onOpenLightbox: (items: LightboxImageItem[], index: number) => latestHandlers.current.handleOpenLightbox(items, index),
     onFileContextMenu: (e: React.MouseEvent, absPath: string, allowPreview = true, extra?: { dataUrl?: string }) => latestHandlers.current.handleFileContextMenu(e, absPath, allowPreview, extra)
@@ -1632,12 +1695,16 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
               <span>OminiHive</span>
             </div>
             <div className="sidebar-top-actions">
-              <button type="button" className="icon-btn" title="打开本地项目 (⌘O)" aria-label="打开本地项目" onClick={add}>
-                <FolderPlus size={16} />
-              </button>
-              <button type="button" className="icon-btn" title="收起侧栏 (⌘/)" aria-label="收起项目栏" onClick={() => setCollapsed(true)}>
-                <PanelLeft size={16} />
-              </button>
+              <Tip side="bottom" content="打开本地项目 (⌘O)">
+                <button type="button" className="icon-btn" aria-label="打开本地项目" onClick={add}>
+                  <FolderPlus size={16} />
+                </button>
+              </Tip>
+              <Tip side="bottom" content="收起侧栏 (⌘/)">
+                <button type="button" className="icon-btn" aria-label="收起项目栏" onClick={() => setCollapsed(true)}>
+                  <PanelLeft size={16} />
+                </button>
+              </Tip>
             </div>
           </div>
 
@@ -1768,6 +1835,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
           </nav>
           </ScrollArea>
 
+          <AgentQuota enabled={{ Codex: enabledAgents.Codex !== false && !!tree?.agents?.Codex, Antigravity: enabledAgents.Antigravity !== false && !!tree?.agents?.Antigravity }} />
           <div className="sidebar-foot">
             <Settings
               missingCount={missingCount}
@@ -1777,15 +1845,16 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
               providers={providers}
               onProviderChange={(ag, pid) => setProviders(prev => ({ ...prev, [ag]: pid }))}
             />
-            <button
-              type="button"
-              className="theme-toggle-btn"
-              onClick={onToggleTheme}
-              title={dark ? '切换到浅色模式' : '切换到深色模式'}
-              aria-label={dark ? '切换到浅色模式' : '切换到深色模式'}
-            >
-              {dark ? <Sun size={15} /> : <Moon size={15} />}
-            </button>
+            <Tip side="top" content={dark ? '切换到浅色模式' : '切换到深色模式'}>
+              <button
+                type="button"
+                className="theme-toggle-btn"
+                onClick={onToggleTheme}
+                aria-label={dark ? '切换到浅色模式' : '切换到深色模式'}
+              >
+                {dark ? <Sun size={15} /> : <Moon size={15} />}
+              </button>
+            </Tip>
           </div>
         </aside>
       )}
@@ -1896,6 +1965,16 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
             <div className="transcript">
               {(() => {
                 const lastAgentMsgId = [...roomMessages].reverse().find(x => x.author !== '我')?.id
+                const lastByAgent = new Map<string, string>()
+                for (const x of roomMessages) if (x.author !== '我') lastByAgent.set(x.author, x.id)
+                // Fallback for replies saved before messages carried their own session id:
+                // the room's binding for that agent (exact key wins over provider-scoped keys).
+                const roomSessions = new Map<string, string>()
+                for (const b of tree?.sessions || []) {
+                  if (b.room !== room || !b.native) continue
+                  const base = b.agent.split(':')[0]
+                  if (b.agent === base || !roomSessions.has(base)) roomSessions.set(base, b.native)
+                }
                 return roomMessages.map(m =>
                   m.author === '我'
                     ? (
@@ -1915,10 +1994,11 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
                         roomId={room}
                         projectDir={project?.dir}
                         isLatest={m.id === lastAgentMsgId}
+                        ctx={lastByAgent.get(m.author) === m.id ? ctxUsage[m.author] : undefined}
                         onStop={a => void api.stop(room, a)}
                         onRetry={messageHandlers.onRetry}
                         onContinue={messageHandlers.onContinue}
-                        onForward={messageHandlers.onForward}
+                        fallbackSession={roomSessions.get(m.author)}
                         onPreviewFile={messageHandlers.onPreviewFile}
                         onOpenLightbox={messageHandlers.onOpenLightbox}
                         onFileContextMenu={messageHandlers.onFileContextMenu}
@@ -2161,6 +2241,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
 
               <ComposerToolbar
                 inspectedAgent={agent}
+                context={ctxUsage[agent]}
                 targetPicker={
                   <TargetSelector
                     members={agents}
@@ -2183,6 +2264,8 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
                     onModel={id => setSelected(s => ({ ...s, [agent]: id }))}
                     effort={effort}
                     onEffort={v => setEfforts(s => ({ ...s, [effortKey]: v }))}
+                    fast={agent === 'Codex' ? codexFast : false}
+                    onToggleFast={agent === 'Codex' ? () => setCodexFast(v => !v) : undefined}
                     onOpen={() => void loadModels(agent)}
                     hint={hints[agent]}
                   />
@@ -2265,7 +2348,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
           onClose={() => setLightbox(null)}
           onOpenInSidePanel={p => void handlePreviewFile(p)}
           onFileContextMenu={messageHandlers.onFileContextMenu}
-          onToast={setCopyToast}
+          onToast={(msg, kind) => showToast(msg, kind || 'ok')}
         />
       )}
 
@@ -2298,7 +2381,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
           )}
           {fileMenu.path && (
             <>
-              <button type="button" onClick={() => copyAbsPath(fileMenu.path)}>
+              <button type="button" onClick={() => void copyAbsPath(fileMenu.path)}>
                 <Copy size={13} />
                 <span>复制绝对路径</span>
               </button>
@@ -2309,11 +2392,11 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
                   <span>在右侧预览</span>
                 </button>
               )}
-              <button type="button" onClick={() => { const p = fileMenu.path; setFileMenu(null); void api.openPath(p, room) }}>
+              <button type="button" onClick={() => void openFromMenu(fileMenu.path, false)}>
                 <ExternalLink size={13} />
                 <span>用系统应用打开</span>
               </button>
-              <button type="button" onClick={() => { const p = fileMenu.path; setFileMenu(null); void api.revealPath(p, room) }}>
+              <button type="button" onClick={() => void openFromMenu(fileMenu.path, true)}>
                 <FolderSearch size={13} />
                 <span>在访达中显示</span>
               </button>
@@ -2323,9 +2406,9 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
       )}
 
       {copyToast && (
-        <div className="copy-toast" role="status">
-          <Check size={13} />
-          <span>{copyToast}</span>
+        <div className={'copy-toast' + (copyToast.kind === 'error' ? ' error' : '')} role={copyToast.kind === 'error' ? 'alert' : 'status'}>
+          {copyToast.kind === 'error' ? <X size={13} /> : <Check size={13} />}
+          <span>{copyToast.message}</span>
         </div>
       )}
 

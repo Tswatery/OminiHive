@@ -2,6 +2,9 @@ import React from 'react'
 import { DropdownMenu } from '@radix-ui/themes'
 import { ArrowUp, Check, ListPlus, Plus, RotateCcw, Shield, ShieldAlert, Sparkles, Square, Terminal, Zap } from 'lucide-react'
 import type { Agent } from './agentMeta'
+import { Tip } from './Tip'
+import { ContextChip } from './ContextMeter'
+import type { ContextUsage } from './usageFormat'
 
 export type AccessMode = 'read-only' | 'workspace' | 'full'
 
@@ -29,7 +32,7 @@ export function AccessModePicker({ agent, value, onChange }: {
   return (
     <DropdownMenu.Root>
       <DropdownMenu.Trigger>
-        <button type="button" className={'tool-chip perm-btn ' + current.chipClass} title={`${agent} 权限：${current.title}`}>
+        <button type="button" className={'tool-chip perm-btn ' + current.chipClass}>
           <current.Icon size={13} />
           <span>{current.chip}</span>
         </button>
@@ -59,6 +62,8 @@ export type ComposerToolbarProps = {
   /** slot: model + effort picker for the inspected agent */
   modelPicker: React.ReactNode
   access: { value: AccessMode; onChange: (mode: AccessMode) => void }
+  /** live context window / session file reading for the inspected agent */
+  context?: ContextUsage
   /** resume the agent's native session vs. start a clean one */
   session: { hasExisting: boolean; fresh: boolean; onToggle: () => void }
   onPickFiles: () => void
@@ -82,6 +87,7 @@ export function ComposerToolbar({
   targetPicker,
   modelPicker,
   access,
+  context,
   session,
   onPickFiles,
   skills,
@@ -97,81 +103,95 @@ export function ComposerToolbar({
       </div>
 
       <div className="toolbar-right">
-        <button
-          type="button"
-          className={'tool-chip icon-only session-btn ' + (!session.hasExisting ? 'cold' : session.fresh ? 'fresh' : 'resume')}
-          disabled={!session.hasExisting}
-          title={
+        {!session.fresh && <ContextChip usage={context} agent={inspectedAgent} compact={send.targetBusy && send.canSend} />}
+        <Tip
+          allowDisabled
+          content={
             !session.hasExisting
-              ? `${inspectedAgent} 在本讨论尚无原生会话，发送后将新开会话`
+              ? `${inspectedAgent} 尚无原生会话，发送后将新开会话`
               : session.fresh
                 ? `${inspectedAgent} 本轮将新开干净会话（点击切回续接）`
-                : `${inspectedAgent} 当前将续接已有原生会话（点击切换为新开会话）`
+                : `重置 ${inspectedAgent} 会话上下文（点击新开干净会话）`
           }
-          onClick={session.onToggle}
         >
-          {(!session.hasExisting || session.fresh) ? <Sparkles size={13} /> : <RotateCcw size={13} />}
-        </button>
-
-        <button
-          type="button"
-          className="tool-chip icon-only img-pick-btn"
-          title="添加图片或文件（也支持直接粘贴或拖入）"
-          onClick={onPickFiles}
-        >
-          <Plus size={15} />
-        </button>
-
-        {skills.count > 0 && (
           <button
             type="button"
-            className="tool-chip skills-btn"
-            title={`查看 ${inspectedAgent} 的 ${skills.count} 个专属 Skills（也可直接输入 /）`}
-            onClick={skills.onToggle}
+            className={'tool-chip icon-only session-btn ' + (!session.hasExisting ? 'cold' : session.fresh ? 'fresh' : 'resume')}
+            disabled={!session.hasExisting}
+            aria-label="重置或切换会话"
+            onClick={session.onToggle}
           >
-            <Sparkles size={12} />
-            <span><em className="skills-word">Skills </em>{skills.count}</span>
+            {(!session.hasExisting || session.fresh) ? <Sparkles size={13} /> : <RotateCcw size={13} />}
           </button>
+        </Tip>
+
+        <Tip content="添加图片或文件（也支持粘贴或拖入）">
+          <button
+            type="button"
+            className="tool-chip icon-only img-pick-btn"
+            aria-label="添加图片或文件"
+            onClick={onPickFiles}
+          >
+            <Plus size={15} />
+          </button>
+        </Tip>
+
+        {skills.count > 0 && (
+          <Tip content={`查看 ${inspectedAgent} 的 ${skills.count} 个专属 Skills（也可输入 /）`}>
+            <button
+              type="button"
+              className="tool-chip skills-btn"
+              onClick={skills.onToggle}
+            >
+              <Sparkles size={12} />
+              <span><em className="skills-word">Skills </em>{skills.count}</span>
+            </button>
+          </Tip>
         )}
 
         {batch.targets.length > 1 && (
-          <span className="batch-pill" title={'将同时发送给：' + batch.targets.join('、')}>
-            {batch.isAll ? `@all · ${batch.targets.length}` : `群发 · ${batch.targets.length}`}
-          </span>
+          <Tip content={'将同时发送给：' + batch.targets.join('、')}>
+            <span className="batch-pill">
+              {batch.isAll ? `@all · ${batch.targets.length}` : `群发 · ${batch.targets.length}`}
+            </span>
+          </Tip>
         )}
 
         {send.targetBusy && send.canSend ? (
           <div className="busy-send-group">
-            <button
-              type="button"
-              className="interrupt-send-btn"
-              onClick={send.onInterrupt}
-              title="立即打断当前运行中的 Agent 并发送 (⌘Enter)"
-            >
-              <Zap size={12} />
-              <span>打断发送</span>
-            </button>
-            <button
-              type="button"
-              className="send queue ready"
-              aria-label="排队发送"
-              onClick={send.onQueue}
-              title="加入待发队列，当前任务结束后自动发送 (Enter)"
-            >
-              <ListPlus size={15} />
-            </button>
+            <Tip content="立即打断当前运行中的 Agent 并发送 (⌘Enter)">
+              <button
+                type="button"
+                className="interrupt-send-btn"
+                onClick={send.onInterrupt}
+              >
+                <Zap size={12} />
+                <span>打断发送</span>
+              </button>
+            </Tip>
+            <Tip content="加入待发队列，当前任务结束后自动发送 (Enter)">
+              <button
+                type="button"
+                className="send queue ready"
+                aria-label="排队发送"
+                onClick={send.onQueue}
+              >
+                <ListPlus size={15} />
+              </button>
+            </Tip>
           </div>
         ) : (
-          <button
-            type="button"
-            className={'send ' + (send.showStop ? 'stop' : '') + (send.canSend ? ' ready' : '')}
-            aria-label={send.showStop ? '停止' : '发送'}
-            disabled={!send.showStop && !send.canSend}
-            onClick={() => send.showStop ? send.onStop() : send.onSend()}
-            title={send.showStop ? '停止当前运行 (⌘.)' : '发送 (Enter)'}
-          >
-            {send.showStop ? <Square size={12} /> : <ArrowUp size={16} />}
-          </button>
+          <Tip allowDisabled content={send.showStop ? '停止当前运行 (⌘.)' : '发送 (Enter)'}>
+            <button
+              type="button"
+              className={'send ' + (send.showStop ? 'stop' : '') + (send.canSend ? ' ready' : '')}
+              aria-label={send.showStop ? '停止' : '发送'}
+              disabled={!send.showStop && !send.canSend}
+              onClick={() => send.showStop ? send.onStop() : send.onSend()}
+            >
+              {send.showStop ? <Square size={12} /> : <ArrowUp size={16} />}
+            </button>
+          </Tip>
         )}
       </div>
     </div>
