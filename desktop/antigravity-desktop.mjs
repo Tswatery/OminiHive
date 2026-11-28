@@ -691,7 +691,10 @@ export async function runDesktopTurn({app, cwd, projectName = '', session, promp
         }
         const text = step.plannerResponse?.modifiedResponse || step.plannerResponse?.response || step.notifyUser?.notificationContent
         if (text) { emit('text', (output ? '\n\n' : '') + text); output = true }
-        if (step.errorMessage) lastError = step.errorMessage.error?.userErrorMessage || step.errorMessage.error?.shortError || 'Antigravity 执行失败'
+        if (step.errorMessage) {
+          lastError = step.errorMessage.error?.userErrorMessage || step.errorMessage.error?.shortError || 'Antigravity 执行失败'
+          emit('log', '::step::' + JSON.stringify({ id: 'ag-err-' + idx, kind: 'info', title: '客户端提示 · ' + String(lastError).slice(0, 160), status: 'error' }))
+        }
         if (!step.plannerResponse && !step.errorMessage) {
           const item = buildAgToolStep(step, idx, step.error ? 'error' : 'done')
           if (item) emit('log', '::step::' + JSON.stringify({ ...item, interaction: null }))

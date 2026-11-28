@@ -927,6 +927,17 @@ export async function execute({agent,cwd,projectName='',prompt,historyPrompt,tit
     }
     const evThread=p.threadId||p.thread?.id||''
     const isSubThread=Boolean(codex && codexThreadId && evThread && evThread!==codexThreadId)
+    if(codex && e.method==='error' && !isSubThread){
+      const errMsg=String(p?.error?.message||p?.message||'网络连接异常').trim().slice(0,180)
+      const retrying=Boolean(p?.willRetry)
+      emitStep({
+        id:'codex-net-retry',
+        kind:'info',
+        title:retrying?`网络连接重试中 · ${errMsg}`:`连接错误 · ${errMsg}`,
+        status:retrying?'running':'error'
+      })
+      return
+    }
     if(codex && e.method==='thread/tokenUsage/updated' && !isSubThread){
       const usage=readCodexTokenUsage(p)
       if(usage)emit('context',usage)

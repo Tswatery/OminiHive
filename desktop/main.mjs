@@ -65,8 +65,17 @@ function issuePreviewUrl(filePath) {
 
 function allRunning() {
   const map = new Map()
-  for (const j of jobs.values()) map.set(j.room + ':' + j.agent, { room: j.room, agent: j.agent })
-  for (const j of bgRunning.values()) map.set(j.room + ':' + j.agent, { room: j.room, agent: j.agent })
+  for (const j of jobs.values()) map.set(j.room + ':' + j.agent, { room: j.room, agent: j.agent, startedAt: j.startedAt, lastActivityAt: j.lastActivityAt })
+  for (const j of bgRunning.values()) {
+    const k = j.room + ':' + j.agent
+    const prev = map.get(k)
+    map.set(k, {
+      room: j.room,
+      agent: j.agent,
+      startedAt: prev?.startedAt || j.startedAt,
+      lastActivityAt: Math.max(prev?.lastActivityAt || 0, j.lastActivityAt || 0) || j.startedAt
+    })
+  }
   return [...map.values()]
 }
 
@@ -263,8 +272,9 @@ async function run(room, text, allowWrite, modelOrPrefs = '', effort = '', targe
   // Reserve every target synchronously, before the first await, so a second send
   // arriving while we sync/prepare cannot start a duplicate run of the same agent.
   const reserved = new Map()
+  const nowStart = Date.now()
   for (const agent of agents) {
-    const entry = { room, agent, controller: new AbortController() }
+    const entry = { room, agent, controller: new AbortController(), startedAt: nowStart, lastActivityAt: nowStart }
     jobs.set(room + ':' + agent, entry)
     reserved.set(agent, entry)
   }
@@ -338,6 +348,12 @@ async function run(room, text, allowWrite, modelOrPrefs = '', effort = '', targe
         signal: controller.signal,
         emit(type, value) {
           if (stoppedMsgIds.has(item.id)) return
+          if (type !== 'context' && type !== 'title') {
+            const ts = Date.now()
+            job.lastActivityAt = ts
+            const bg = bgRunning.get(key)
+            if (bg && bg.msgId === item.id) bg.lastActivityAt = ts
+          }
           if (type === 'title') {
             const clean = String(value || '').trim()
             if (clean && store.autoTitleRoom(room, clean)) changed()
@@ -353,7 +369,9 @@ async function run(room, text, allowWrite, modelOrPrefs = '', effort = '', targe
             contextUsage.setLive(room, item.agent, value === '执行中')
             if (value === '执行中') watchLiveSizes()
             if (value === '执行中') {
-              bgRunning.set(key, { room, agent: item.agent, msgId: item.id, cascadeId })
+              const nowBg = Date.now()
+              const prevBg = bgRunning.get(key)
+              bgRunning.set(key, { room, agent: item.agent, msgId: item.id, cascadeId, startedAt: prevBg?.startedAt || job.startedAt || nowBg, lastActivityAt: nowBg })
               store.setStatus(item.id, '执行中')
             } else {
               if (bgRunning.get(key)?.msgId === item.id) bgRunning.delete(key)

@@ -41,7 +41,12 @@ type Project = { id: string; name: string; dir: string }
 type Room = { id: string; project: string; title: string; title_locked?: number; title_auto?: number }
 type Msg = { id: string; author: string; body: string; log: string; status: string; time: number; duration?: number; attachments?: string; session?: string }
 type ImageDraft = { id: string; name: string; dataUrl: string; isImage: boolean }
-type RunningJob = { room: string; agent: Agent }
+type RunningJob = { room: string; agent: Agent; startedAt?: number; lastActivityAt?: number }
+const STALL_WARN_MS = 3 * 60 * 1000
+const isJobStalled = (j: RunningJob, now: number) => {
+  const ref = j.lastActivityAt || j.startedAt || 0
+  return ref > 0 && now - ref >= STALL_WARN_MS
+}
 type SessionBinding = { room: string; agent: string; native?: string }
 type Tree = { projects: Project[]; rooms: Room[]; agents: Record<Agent, boolean>; running?: RunningJob[]; sessions?: SessionBinding[] }
 type SkillEntry = { id: string; name: string; description: string; source: string; path: string }
@@ -110,18 +115,19 @@ const STARTER_PROMPTS = [
 
 
 
-/** Sidebar status: breathing dots for running agents, solid agent-colored dots for finished ones. */
-function AgentStatusDots({ running, done, justDone, scope = '' }: { running: string[]; done: string[]; justDone: string[]; scope?: string }) {
+/** Sidebar status: breathing dots for running agents, amber alert dots for stalled ones, solid dots for finished ones. */
+function AgentStatusDots({ running, stalled = [], done, justDone, scope = '' }: { running: string[]; stalled?: string[]; done: string[]; justDone: string[]; scope?: string }) {
   const runningSet = new Set(running)
+  const stalledSet = new Set(stalled)
   const finished = done.filter(a => !runningSet.has(a))
   if (!running.length && !finished.length) return null
   const title = [
-    ...running.map(a => `${agentShort(a)} 执行中`),
+    ...running.map(a => `${agentShort(a)} ${stalledSet.has(a) ? '疑似卡住（长时间无输出）' : '执行中'}`),
     ...finished.map(a => `${agentShort(a)} 已完成`)
   ].join('、')
   return (
     <span className="room-dots" title={scope ? `${scope}：${title}` : title}>
-      {running.map(a => <i key={'r-' + a} className="dot" style={{ '--agent-dot': agentColor(a) } as React.CSSProperties} />)}
+      {running.map(a => <i key={'r-' + a} className={'dot' + (stalledSet.has(a) ? ' stalled' : '')} style={{ '--agent-dot': agentColor(a) } as React.CSSProperties} />)}
       {finished.map(a => (
         <span
           key={'d-' + a}
@@ -445,23 +451,38 @@ const UserBubble = React.memo(function UserBubble({
   )
 })
 
-function LiveTimer({ startTime }: { startTime: number }) {
+function RunningStatusPill({ startTime, lastActivityAt, hasWaiting }: { startTime: number; lastActivityAt?: number; hasWaiting: boolean }) {
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 500)
     return () => clearInterval(id)
   }, [])
-  return <>{formatDuration(now - startTime)}</>
+  const totalLabel = formatDuration(now - startTime)
+  const idleMs = lastActivityAt ? Math.max(0, now - lastActivityAt) : 0
+  const stalled = !hasWaiting && idleMs >= STALL_WARN_MS
+  const idleMin = Math.floor(idleMs / 60000)
+  const cls = hasWaiting ? 'waiting' : stalled ? 'stalled' : 'running'
+  const title = stalled
+    ? `总耗时 ${totalLabel}，已连续 ${idleMin} 分钟无新输出，可能因网络超时或代理中断卡住`
+    : undefined
+  return (
+    <span className={'status-pill ' + cls} title={title}>
+      <span className="pulse-dot" />
+      {hasWaiting ? `等待确认 · ${totalLabel}` : stalled ? `疑似卡住 · 无响应 ${idleMin}m` : `执行中 · ${totalLabel}`}
+    </span>
+  )
 }
 
 const AgentMessage = React.memo(function AgentMessage({
-  m, roomId, projectDir, isLatest, ctx, fallbackSession, onStop, onRetry, onContinue, onPreviewFile, onOpenLightbox, onFileContextMenu
+  m, roomId, projectDir, isLatest, ctx, lastActivityAt, fallbackSession, onStop, onRetry, onContinue, onPreviewFile, onOpenLightbox, onFileContextMenu
 }: {
   m: Msg
   /** the room's current native session for this agent, for replies saved before messages carried one */
   fallbackSession?: string
   /** context window reading, passed only to the newest message of each agent */
   ctx?: ContextUsage
+  /** last substantive event timestamp while this agent is running */
+  lastActivityAt?: number
   roomId: string
   projectDir?: string
   isLatest?: boolean
@@ -549,10 +570,7 @@ const AgentMessage = React.memo(function AgentMessage({
             <span className="sync-tag">{syncOnlyLabel}</span>
           )}
           {isRunning && (
-            <span className={'status-pill ' + (hasWaiting ? 'waiting' : 'running')}>
-              <span className="pulse-dot" />
-              {hasWaiting ? '等待确认' : '执行中'} · <LiveTimer startTime={m.time} />
-            </span>
+            <RunningStatusPill startTime={m.time} lastActivityAt={lastActivityAt} hasWaiting={hasWaiting} />
           )}
           {isFailed && <span className={'status-pill ' + (m.status === '失败' ? 'failed' : 'stopped')}>{m.status}</span>}
           {ctx && agent && <ContextInline usage={ctx} agent={agent} />}
@@ -766,6 +784,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
   const [lightbox, setLightbox] = useState<{ items: LightboxImageItem[]; index: number } | null>(null)
   const [fileMenu, setFileMenu] = useState<{ x: number; y: number; path: string; allowPreview: boolean; isImage: boolean; dataUrl?: string } | null>(null)
   const [copyToast, setCopyToast] = useState<{ message: string; kind: 'ok' | 'error' } | null>(null)
+  const [stallNow, setStallNow] = useState(() => Date.now())
   const showToast = (message: string, kind: 'ok' | 'error' = 'ok') => setCopyToast({ message, kind })
   const [enabledAgents, setEnabledAgents] = useState<Record<string, boolean>>(() => loadJson('ominihive:enabled', { Codex: true, Claude: true, Antigravity: true }))
   const [roomMembersMap, setRoomMembersMap] = useState<Record<string, Agent[]>>(() => loadJson('ominihive:room-members', {}))
@@ -1584,6 +1603,14 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
     void send('@' + a + ' 请继续完成刚才中断或未完成的任务，并给出完整结果。', a)
   }
 
+  const hasAnyRunning = Boolean(tree?.running?.length)
+  useEffect(() => {
+    if (!hasAnyRunning) return
+    setStallNow(Date.now())
+    const id = setInterval(() => setStallNow(Date.now()), 15000)
+    return () => clearInterval(id)
+  }, [hasAnyRunning])
+
   useEffect(() => {
     if (!copyToast) return
     const t = setTimeout(() => setCopyToast(null), copyToast.kind === 'error' ? 2600 : 1800)
@@ -1723,7 +1750,9 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
               const isCurrentProj = project?.id === p.id
               const projRooms = tree.rooms.filter(r => r.project === p.id)
               const projRoomIds = new Set(projRooms.map(r => r.id))
-              const projRunningAgents = [...new Set((tree.running || []).filter(j => projRoomIds.has(j.room)).map(j => j.agent))]
+              const projJobs = (tree.running || []).filter(j => projRoomIds.has(j.room))
+              const projRunningAgents = [...new Set(projJobs.map(j => j.agent))]
+              const projStalledAgents = [...new Set(projJobs.filter(j => isJobStalled(j, stallNow)).map(j => j.agent))]
               const projDoneAgents = [...new Set(projRooms.flatMap(r => [...(unreadDoneRooms[r.id] || []), ...(justDoneRooms[r.id] || [])]))]
               const projJustDone = [...new Set(projRooms.flatMap(r => justDoneRooms[r.id] || []))]
               return (
@@ -1752,7 +1781,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
                           <ChevronRight size={13} className={'proj-caret ' + (isOpen ? 'open' : '')} />
                           {isOpen ? <FolderOpen size={15} /> : <Folder size={15} />}
                           <span>{p.name}</span>
-                          <AgentStatusDots running={projRunningAgents} done={projDoneAgents} justDone={projJustDone} scope="项目中" />
+                          <AgentStatusDots running={projRunningAgents} stalled={projStalledAgents} done={projDoneAgents} justDone={projJustDone} scope="项目中" />
                         </button>
                         <div className="row-actions">
                           <button
@@ -1808,7 +1837,12 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
                                 >
                                   <MessageSquare size={13} />
                                   <TypewriterTitle text={r.title} animate={isAutoTitle(r)} />
-                                  <AgentStatusDots running={roomJobs.map(j => j.agent)} done={roomDoneAgents} justDone={roomJustDone} />
+                                  <AgentStatusDots
+                                    running={roomJobs.map(j => j.agent)}
+                                    stalled={roomJobs.filter(j => isJobStalled(j, stallNow)).map(j => j.agent)}
+                                    done={roomDoneAgents}
+                                    justDone={roomJustDone}
+                                  />
                                 </button>
                                 <div className="row-actions">
                                   <button
@@ -1995,6 +2029,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
                         projectDir={project?.dir}
                         isLatest={m.id === lastAgentMsgId}
                         ctx={lastByAgent.get(m.author) === m.id ? ctxUsage[m.author] : undefined}
+                        lastActivityAt={m.status === '执行中' ? runningInRoom.find(j => j.agent === m.author)?.lastActivityAt : undefined}
                         onStop={a => void api.stop(room, a)}
                         onRetry={messageHandlers.onRetry}
                         onContinue={messageHandlers.onContinue}
@@ -2187,7 +2222,7 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
                     const el = e.currentTarget
                     const selStart = el.selectionStart
                     const selEnd = el.selectionEnd
-                    if (e.key === 'ArrowUp' && sentHistory.length > 0 && selStart === selEnd && !el.value.slice(0, selStart).includes('\n')) {
+                    if (e.key === 'ArrowUp' && sentHistory.length > 0 && selStart === 0 && selEnd === 0) {
                       e.preventDefault()
                       if (historyIdxRef.current === -1) {
                         historyDraftRef.current = input
@@ -2200,11 +2235,11 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
                       setMention(null)
                       setSlash(null)
                       requestAnimationFrame(() => {
-                        textarea.current?.setSelectionRange(nextText.length, nextText.length)
+                        textarea.current?.setSelectionRange(0, 0)
                       })
                       return
                     }
-                    if (e.key === 'ArrowDown' && historyIdxRef.current !== -1 && selStart === selEnd && !el.value.slice(selEnd).includes('\n')) {
+                    if (e.key === 'ArrowDown' && historyIdxRef.current !== -1 && selStart === selEnd && (selEnd === el.value.length || selStart === 0)) {
                       e.preventDefault()
                       let nextText: string
                       if (historyIdxRef.current < sentHistory.length - 1) {
@@ -2218,7 +2253,8 @@ function App({ dark, onToggleTheme }: { dark: boolean; onToggleTheme: () => void
                       setMention(null)
                       setSlash(null)
                       requestAnimationFrame(() => {
-                        textarea.current?.setSelectionRange(nextText.length, nextText.length)
+                        const pos = historyIdxRef.current === -1 ? nextText.length : 0
+                        textarea.current?.setSelectionRange(pos, pos)
                       })
                       return
                     }

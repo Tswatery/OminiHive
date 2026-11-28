@@ -407,6 +407,18 @@ aside nav {
   animation: pulse 1.4s ease-in-out infinite;
 }
 
+.dot.stalled {
+  background: #ea580c;
+  box-shadow: 0 0 0 2px rgba(234, 88, 12, 0.25);
+  animation: none;
+}
+
+.dark .dot.stalled,
+[data-theme="dark"] .dot.stalled {
+  background: #fb923c;
+  box-shadow: 0 0 0 2px rgba(251, 146, 60, 0.28);
+}
+
 /* Finished but unread: solid dot with a soft halo in the agent's color. */
 .done-dot {
   --agent-dot: var(--accent);
@@ -999,6 +1011,17 @@ main {
 .status-pill.waiting {
   background: var(--write-soft);
   color: var(--write-color);
+}
+
+.status-pill.stalled {
+  background: rgba(234, 88, 12, 0.14);
+  color: #c2410c;
+}
+
+.dark .status-pill.stalled,
+[data-theme="dark"] .status-pill.stalled {
+  background: rgba(251, 146, 60, 0.18);
+  color: #fb923c;
 }
 
 .status-pill.failed {
